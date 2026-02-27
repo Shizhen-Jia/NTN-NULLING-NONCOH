@@ -1,0 +1,21 @@
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Output files (可选)
+*.npy
+*.npz
+*.log
+*.pkl
+
+# OS files
+.DS_Store
+Thumbs.db
+# 忽略结果文件夹
+ResultPlot/
+blender_scene_big/
+Denver_Scene/
+blender_scene_big/
