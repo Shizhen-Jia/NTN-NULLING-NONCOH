@@ -515,6 +515,7 @@ def upa_steering_global(
     d_v: float = 0.5,
     panel_plane: Literal["yz", "xz", "xy"] = "yz",
     phase_sign: Literal[-1, 1] = 1,
+    horizontal_sign: Literal[-1, 1] = 1,
     flatten_order: Literal["C", "F"] = "C",
     rotation_order: Literal["zyx", "zxy", "yxz", "yzx", "xyz", "xzy"] = "zyx",
 ) -> np.ndarray:
@@ -529,6 +530,8 @@ def upa_steering_global(
       - "xy": horizontal axis is local x, vertical axis is local y
     - phase_sign:
       - +1 or -1 for convention matching with channel phasor sign.
+    - horizontal_sign:
+      - +1 or -1 to set horizontal-axis handedness in steering.
     """
     u_global = _unit_vector_from_angles(phi_deg, theta_deg)
 
@@ -554,10 +557,11 @@ def upa_steering_global(
     rr, cc = np.meshgrid(rows, cols, indexing="ij")
 
     sgn = 1.0 if int(phase_sign) >= 0 else -1.0
+    hsgn = 1.0 if int(horizontal_sign) >= 0 else -1.0
     if flatten_order not in ("C", "F"):
         raise ValueError("flatten_order must be 'C' or 'F'.")
 
-    phase = sgn * 2.0 * np.pi * (d_h * cc * u_h + d_v * rr * u_v)
+    phase = sgn * 2.0 * np.pi * (d_h * cc * hsgn * u_h + d_v * rr * u_v)
     a = np.exp(1j * phase).reshape(-1, 1, order=flatten_order)
     return a / np.sqrt(float(num_rows * num_cols))
 
@@ -585,6 +589,7 @@ def music_top_peaks(
     orientation_rad: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     panel_plane: Literal["yz", "xz", "xy"] = "yz",
     phase_sign: Literal[-1, 1] = 1,
+    horizontal_sign: Literal[-1, 1] = 1,
     flatten_order: Literal["C", "F"] = "C",
     forward_only: bool = False,
     forward_cos_min: float = 0.0,
@@ -625,6 +630,7 @@ def music_top_peaks(
                 orientation_rad=orientation_rad,
                 panel_plane=panel_plane,
                 phase_sign=phase_sign,
+                horizontal_sign=horizontal_sign,
                 flatten_order=flatten_order,
                 rotation_order=rotation_order,
             )
@@ -685,6 +691,7 @@ def build_steering_bank(
     orientation_rad: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     panel_plane: Literal["yz", "xz", "xy"] = "yz",
     phase_sign: Literal[-1, 1] = 1,
+    horizontal_sign: Literal[-1, 1] = 1,
     flatten_order: Literal["C", "F"] = "C",
     forward_only: bool = False,
     forward_cos_min: float = 0.0,
@@ -729,6 +736,7 @@ def build_steering_bank(
                 orientation_rad=orientation_rad,
                 panel_plane=panel_plane,
                 phase_sign=phase_sign,
+                horizontal_sign=horizontal_sign,
                 flatten_order=flatten_order,
                 rotation_order=rotation_order,
             )
@@ -757,13 +765,17 @@ def estimate_angle_from_channel_scan(
     theta_bank_deg: np.ndarray,
     *,
     scan_mode: Literal["complex", "phase_only"] = "complex",
-) -> Tuple[float, float, float]:
+    return_index: bool = False,
+) -> Tuple[float, float, float] | Tuple[float, float, float, int]:
     """Estimate one user angle by scanning steering dictionary against channel vector.
 
     Score is |a^H h| with normalized h and normalized steering columns.
-    Returns (phi_hat_deg, theta_hat_deg, score_max).
+    Returns (phi_hat_deg, theta_hat_deg, score_max) by default.
+    If `return_index=True`, also returns the steering-bank index.
     """
     if a_bank.size == 0 or phi_bank_deg.size == 0:
+        if return_index:
+            return float("nan"), float("nan"), float("nan"), -1
         return float("nan"), float("nan"), float("nan")
 
     a = _as_complex_array(a_bank)
@@ -781,6 +793,8 @@ def estimate_angle_from_channel_scan(
 
     nh = float(np.linalg.norm(h))
     if nh <= 1e-12:
+        if return_index:
+            return float("nan"), float("nan"), float("nan"), -1
         return float("nan"), float("nan"), float("nan")
     h = h / nh
 
@@ -797,8 +811,12 @@ def estimate_angle_from_channel_scan(
         corrs = np.abs((a_phase.conj().T @ h_phase).reshape(-1))
 
     if corrs.size == 0:
+        if return_index:
+            return float("nan"), float("nan"), float("nan"), -1
         return float("nan"), float("nan"), float("nan")
     idx = int(np.argmax(corrs))
+    if return_index:
+        return float(phi_bank_deg[idx]), float(theta_bank_deg[idx]), float(corrs[idx]), idx
     return float(phi_bank_deg[idx]), float(theta_bank_deg[idx]), float(corrs[idx])
 
 
@@ -1085,6 +1103,10 @@ def run_music_angle_pipeline(
     hat_channel_mode: Literal["raw", "conj", "auto"] = "conj",
     ref_mode_for_auto: Literal["aod", "aoa_reverse"] = "aod",
     auto_mode_min_pairs: int = 1,
+    selection_strategy: Literal["truth_guided", "fit_score"] = "truth_guided",
+    fit_selection_metric: Literal["mean", "median"] = "mean",
+    phi_mirror_about_sector: bool = False,
+    steering_horizontal_sign: Literal[-1, 1] = 1,
     use_sector_orientation: bool = True,
     sector_pitch_rad: float = -0.174533,
     sector_roll_rad: float = 0.0,
@@ -1114,6 +1136,19 @@ def run_music_angle_pipeline(
         explicit links (useful for TN serving pairs).
     true_pair_map : dict | None
         Optional true-angle map used for candidate auto-selection metrics.
+    selection_strategy : {"truth_guided", "fit_score"}
+        Candidate selection strategy.
+        - "truth_guided": choose by angle error on matched `true_pair_map` pairs.
+        - "fit_score"   : choose by MUSIC channel-steering fit score only.
+    fit_selection_metric : {"mean", "median"}
+        Aggregation metric over per-link fit scores when `selection_strategy="fit_score"`.
+    phi_mirror_about_sector : bool
+        If True, mirror azimuth around the serving sector yaw:
+            phi <- (2*yaw_sector_deg - phi) mod 360.
+        This fixes left-right azimuth handedness mismatch when present.
+    steering_horizontal_sign : {-1, +1}
+        Horizontal-axis sign used in steering model. Prefer fixing handedness
+        here instead of using output-space mirror compensation.
 
     Returns
     -------
@@ -1132,6 +1167,14 @@ def run_music_angle_pipeline(
         theta_grid_deg = np.arange(0.0, 181.0, 2.0)
 
     true_map = true_pair_map if true_pair_map is not None else {}
+    strategy = str(selection_strategy).lower().strip()
+    if strategy not in ("truth_guided", "fit_score"):
+        raise ValueError("selection_strategy must be 'truth_guided' or 'fit_score'.")
+    fit_metric = str(fit_selection_metric).lower().strip()
+    if fit_metric not in ("mean", "median"):
+        raise ValueError("fit_selection_metric must be 'mean' or 'median'.")
+    if int(steering_horizontal_sign) not in (-1, 1):
+        raise ValueError("steering_horizontal_sign must be -1 or +1.")
 
     # Optional constrained pair mode (typically TN serving links)
     pair_keys_by_tx: Optional[Dict[int, List[int]]] = None
@@ -1154,7 +1197,9 @@ def run_music_angle_pipeline(
 
     pair_hat: Dict[Tuple[int, int], Dict[str, Any]] = {}
     candidate_metric_log: Dict[str, List[Dict[str, float]]] = {}
+    candidate_fit_log: Dict[str, List[Dict[str, float]]] = {}
     selected_metric_log: List[Dict[str, float]] = []
+    selected_fit_record: List[float] = []
     selected_mode_record: List[str] = []
     selected_manifold_record: List[str] = []
     selected_flatten_record: List[str] = []
@@ -1234,6 +1279,7 @@ def run_music_angle_pipeline(
                         float(sector_pitch_rad),
                         float(sector_roll_rad),
                         str(rotation_order),
+                        int(steering_horizontal_sign),
                         bool(sector_forward_only),
                         float(sector_forward_cos_min),
                     )
@@ -1246,6 +1292,7 @@ def run_music_angle_pipeline(
                             orientation_rad=orientation_rad,
                             panel_plane=panel_plane,
                             phase_sign=phase_sign,
+                            horizontal_sign=int(steering_horizontal_sign),
                             flatten_order=flat,
                             forward_only=bool(sector_forward_only),
                             forward_cos_min=float(sector_forward_cos_min),
@@ -1256,23 +1303,36 @@ def run_music_angle_pipeline(
                     for sm in scan_candidates:
                         for poff in phi_offset_candidates:
                             hats_mode: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+                            fit_vals_mode: List[float] = []
                             for rx_i in rx_indices_mode:
                                 ant_norms = np.linalg.norm(hi_mode[int(rx_i), :, :], axis=1)
                                 ant_idx = int(np.argmax(ant_norms))
-                                phi_hat, theta_hat, _fit = estimate_angle_from_channel_scan(
+                                phi_hat, theta_hat, fit_val = estimate_angle_from_channel_scan(
                                     hi_mode[int(rx_i), ant_idx, :],
                                     a_bank,
                                     phi_bank_deg,
                                     theta_bank_deg,
                                     scan_mode=sm,
                                 )
+                                if np.isfinite(fit_val):
+                                    fit_vals_mode.append(float(fit_val))
                                 if np.isfinite(phi_hat):
+                                    if bool(phi_mirror_about_sector):
+                                        yaw_deg = 360.0 * float(sec_idx) / float(nsect_eff)
+                                        phi_hat = float((2.0 * yaw_deg - float(phi_hat)) % 360.0)
                                     phi_hat = float((phi_hat + float(poff)) % 360.0)
                                 hats_mode[(int(rx_i), int(t))] = (
                                     float(phi_hat),
                                     float(theta_hat),
                                     float(score_user_mode[int(rx_i)]),
                                 )
+
+                            if len(fit_vals_mode) > 0:
+                                fit_mean_mode = float(np.mean(fit_vals_mode))
+                                fit_median_mode = float(np.median(fit_vals_mode))
+                            else:
+                                fit_mean_mode = float("nan")
+                                fit_median_mode = float("nan")
 
                             metric_mode: Optional[Dict[str, float]] = None
                             matched = [k for k in hats_mode.keys() if k in true_map]
@@ -1298,12 +1358,23 @@ def run_music_angle_pipeline(
                                 candidate_metric_log.setdefault(ckey, []).append(metric_mode)
 
                             ckey = f"{mode}|{mani_label}|{flat}|{sm}|{float(poff):.1f}"
+                            candidate_fit_log.setdefault(ckey, []).append(
+                                {
+                                    "fit_mean": float(fit_mean_mode),
+                                    "fit_median": float(fit_median_mode),
+                                    "fit_count": float(len(fit_vals_mode)),
+                                    "t": float(int(t)),
+                                }
+                            )
                             candidate_results[ckey] = {
                                 "mode": mode,
                                 "manifold": mani_label,
                                 "flatten": flat,
                                 "scan": sm,
                                 "phi_offset_deg": float(poff),
+                                "fit_mean": float(fit_mean_mode),
+                                "fit_median": float(fit_median_mode),
+                                "fit_count": int(len(fit_vals_mode)),
                                 "music_out": music_out,
                                 "detected_mask_user": detected_mask_user_mode,
                                 "detected_mask_per_ant": detected_mask_per_ant_mode,
@@ -1331,18 +1402,33 @@ def run_music_angle_pipeline(
             if selected_key not in candidate_results:
                 selected_key = list(candidate_results.keys())[0]
         else:
-            scored: List[Tuple[float, str]] = []
-            for ckey, cres in candidate_results.items():
-                met = cres["metric"]
-                if met is None:
-                    continue
-                val = float(met["phi_mae_deg"] + met["theta_mae_deg"])
-                if np.isfinite(val):
-                    scored.append((val, ckey))
-            if len(scored) > 0:
-                scored.sort(key=lambda x: x[0])
-                selected_key = scored[0][1]
-            else:
+            selected_key: Optional[str] = None
+            if strategy == "truth_guided":
+                scored: List[Tuple[float, str]] = []
+                for ckey, cres in candidate_results.items():
+                    met = cres["metric"]
+                    if met is None:
+                        continue
+                    val = float(met["phi_mae_deg"] + met["theta_mae_deg"])
+                    if np.isfinite(val):
+                        scored.append((val, ckey))
+                if len(scored) > 0:
+                    scored.sort(key=lambda x: x[0])
+                    selected_key = scored[0][1]
+
+            if selected_key is None:
+                fit_scored: List[Tuple[float, str]] = []
+                fit_key = "fit_median" if fit_metric == "median" else "fit_mean"
+                for ckey, cres in candidate_results.items():
+                    fit_val = float(cres.get(fit_key, np.nan))
+                    if np.isfinite(fit_val):
+                        # maximize fit score
+                        fit_scored.append((-fit_val, ckey))
+                if len(fit_scored) > 0:
+                    fit_scored.sort(key=lambda x: x[0])
+                    selected_key = fit_scored[0][1]
+
+            if selected_key is None:
                 pref: List[Tuple[int, int, int, int, str]] = []
                 for ckey, cres in candidate_results.items():
                     rank_mode = 0 if cres["mode"] == "raw" else 1
@@ -1359,6 +1445,7 @@ def run_music_angle_pipeline(
         selected_flatten_record.append(str(selected["flatten"]))
         selected_scan_record.append(str(selected["scan"]))
         selected_phi_offset_record.append(float(selected.get("phi_offset_deg", 0.0)))
+        selected_fit_record.append(float(selected.get("fit_mean", np.nan)))
         num_sources_record.append(int(selected.get("num_sources_est", 0)))
 
         if selected["metric"] is not None:
@@ -1426,8 +1513,394 @@ def run_music_angle_pipeline(
         "selected_flatten_record": np.asarray(selected_flatten_record, dtype=object),
         "selected_scan_record": np.asarray(selected_scan_record, dtype=object),
         "selected_phi_offset_record": np.asarray(selected_phi_offset_record, dtype=float),
+        "selected_fit_record": np.asarray(selected_fit_record, dtype=float),
         "num_sources_record": np.asarray(num_sources_record, dtype=int),
         "candidate_metric_log": candidate_metric_log,
+        "candidate_fit_log": candidate_fit_log,
+        "selected_metric_log": selected_metric_log,
+        "detected_rx_indices_by_tx": detected_rx_indices_by_tx,
+        "detected_rx_indices_unique": detected_rx_indices_unique,
+    }
+
+
+def run_music_standard_pipeline(
+    h_all: np.ndarray,
+    *,
+    tx_rows: int,
+    tx_cols: int,
+    nsect: int,
+    pair_keys: Optional[Iterable[Tuple[int, int]]] = None,
+    detect_num_sources: Optional[int] = None,
+    detect_threshold: Optional[float] = 1.0,
+    detect_user_powers: Optional[np.ndarray] = None,
+    detect_noise_var: float = 0.0,
+    detect_covariance_mode: Literal["analytic", "sample"] = "sample",
+    detect_num_snapshots: int = 100,
+    detect_rng_seed: Optional[int] = None,
+    detect_source_estimation: Literal["mdl", "energy"] = "mdl",
+    detect_energy_ratio: float = 0.95,
+    detect_reduce_rx_ant: Literal["max", "mean"] = "max",
+    channel_mode: Literal["raw", "conj"] = "conj",
+    manifold_label: str = "yz:+1",
+    flatten_order: Literal["C", "F"] = "F",
+    scan_mode: Literal["complex", "phase_only"] = "complex",
+    phi_offset_deg: float = 0.0,
+    phi_mirror_about_sector: bool = False,
+    steering_horizontal_sign: Literal[-1, 1] = 1,
+    use_sector_orientation: bool = True,
+    sector_pitch_rad: float = -0.174533,
+    sector_roll_rad: float = 0.0,
+    rotation_order: Literal["zyx", "zxy", "yxz", "yzx", "xyz", "xzy"] = "zyx",
+    sector_forward_only: bool = True,
+    sector_forward_cos_min: float = 0.0,
+    phi_grid_deg: Optional[Iterable[float]] = None,
+    theta_grid_deg: Optional[Iterable[float]] = None,
+) -> Dict[str, Any]:
+    """Run a fixed-convention MUSIC pipeline without truth-guided mode search.
+
+    This is the "standard" path when you want one deterministic MUSIC setup
+    (e.g., conj + yz:+1 + F + complex + 0-deg offset), and only compare to
+    Sionna truth at the end for evaluation.
+    """
+    h = _as_complex_array(h_all)
+    if h.ndim != 4:
+        raise ValueError("h_all must have shape (num_rx, num_rx_ant, num_tx, num_tx_ant).")
+
+    num_rx, _num_rx_ant, num_tx, num_tx_ant = h.shape
+    nsect_eff = int(max(int(nsect), 1))
+
+    if phi_grid_deg is None:
+        phi_grid_deg = np.arange(0.0, 360.0, 2.0)
+    if theta_grid_deg is None:
+        theta_grid_deg = np.arange(0.0, 181.0, 2.0)
+
+    if channel_mode not in ("raw", "conj"):
+        raise ValueError("channel_mode must be 'raw' or 'conj'.")
+    if flatten_order not in ("C", "F"):
+        raise ValueError("flatten_order must be 'C' or 'F'.")
+    if scan_mode not in ("complex", "phase_only"):
+        raise ValueError("scan_mode must be 'complex' or 'phase_only'.")
+    if int(steering_horizontal_sign) not in (-1, 1):
+        raise ValueError("steering_horizontal_sign must be -1 or +1.")
+    manifold_key, panel_plane, phase_sign = _parse_manifold_label(manifold_label)
+    phi_off = float(np.round(float(phi_offset_deg) % 360.0, 1))
+
+    pair_keys_by_tx: Optional[Dict[int, List[int]]] = None
+    if pair_keys is not None:
+        pair_keys_by_tx = {}
+        for rx, t in pair_keys:
+            rx_i = int(rx)
+            t_i = int(t)
+            if rx_i < 0 or rx_i >= num_rx or t_i < 0 or t_i >= num_tx:
+                continue
+            pair_keys_by_tx.setdefault(t_i, []).append(rx_i)
+        for t_i in list(pair_keys_by_tx.keys()):
+            pair_keys_by_tx[t_i] = sorted(set(pair_keys_by_tx[t_i]))
+
+    pair_hat: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    h_hat_all_mode = np.zeros_like(h, dtype=np.complex128)
+    h_hat_all_raw = np.zeros_like(h, dtype=np.complex128)
+    selected_mode_record: List[str] = []
+    selected_manifold_record: List[str] = []
+    selected_flatten_record: List[str] = []
+    selected_scan_record: List[str] = []
+    selected_phi_offset_record: List[float] = []
+    selected_fit_record: List[float] = []
+    num_sources_record: List[int] = []
+    candidate_metric_log: Dict[str, List[Dict[str, float]]] = {}
+    candidate_fit_log: Dict[str, List[Dict[str, float]]] = {}
+    selected_metric_log: List[Dict[str, float]] = []
+    detected_rx_indices_by_tx: Dict[int, np.ndarray] = {}
+
+    steering_cache: Dict[Tuple[Any, ...], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    ckey = f"{channel_mode}|{manifold_key}|{flatten_order}|{scan_mode}|{phi_off:.1f}"
+
+    for t in range(num_tx):
+        if pair_keys_by_tx is not None and t not in pair_keys_by_tx:
+            continue
+
+        hi_raw = h[:, :, t, :]
+        hi_mode = hi_raw if channel_mode == "raw" else np.conj(hi_raw)
+
+        if pair_keys_by_tx is None:
+            music_out = detect_music_from_hi(
+                hi=hi_mode,
+                num_sources=detect_num_sources,
+                threshold=detect_threshold,
+                user_powers=detect_user_powers,
+                noise_var=detect_noise_var,
+                covariance_mode=detect_covariance_mode,
+                num_snapshots=detect_num_snapshots,
+                rng_seed=detect_rng_seed,
+                source_estimation=detect_source_estimation,
+                energy_ratio=detect_energy_ratio,
+                reduce_ntn_ant=detect_reduce_rx_ant,
+            )
+            detected_mask_user = np.asarray(music_out["detected_mask_user"], dtype=bool)
+            detected_mask_per_ant = np.asarray(music_out["detected_mask_per_ant"], dtype=bool)
+            score_user = np.asarray(music_out["score_user"], dtype=float)
+            rx_indices = np.where(detected_mask_user)[0]
+            num_sources_est = int(np.asarray(music_out["num_sources_est"]).item())
+        else:
+            rx_indices_fixed = np.asarray(pair_keys_by_tx[t], dtype=int)
+            if rx_indices_fixed.size == 0:
+                continue
+            detected_mask_user = np.zeros((num_rx,), dtype=bool)
+            detected_mask_user[rx_indices_fixed] = True
+            detected_mask_per_ant = np.repeat(detected_mask_user[:, None], hi_mode.shape[1], axis=1)
+            score_user = np.linalg.norm(hi_mode, axis=(1, 2))
+            rx_indices = rx_indices_fixed
+            num_sources_est = -1
+            music_out = None
+
+        sec_idx = int(t) % nsect_eff
+        if use_sector_orientation:
+            yaw = 2.0 * np.pi * sec_idx / float(nsect_eff)
+            orientation_rad = (float(yaw), float(sector_pitch_rad), float(sector_roll_rad))
+        else:
+            orientation_rad = (0.0, 0.0, 0.0)
+
+        nr = int(tx_rows)
+        nc = int(tx_cols)
+        if nr * nc != num_tx_ant:
+            nr, nc = 1, int(num_tx_ant)
+
+        skey = (
+            sec_idx,
+            nr,
+            nc,
+            manifold_key,
+            flatten_order,
+            bool(use_sector_orientation),
+            float(sector_pitch_rad),
+            float(sector_roll_rad),
+            str(rotation_order),
+            int(steering_horizontal_sign),
+            bool(sector_forward_only),
+            float(sector_forward_cos_min),
+        )
+        if skey not in steering_cache:
+            steering_cache[skey] = build_steering_bank(
+                num_rows=nr,
+                num_cols=nc,
+                phi_grid_deg=phi_grid_deg,
+                theta_grid_deg=theta_grid_deg,
+                orientation_rad=orientation_rad,
+                panel_plane=panel_plane,
+                phase_sign=phase_sign,
+                horizontal_sign=int(steering_horizontal_sign),
+                flatten_order=flatten_order,
+                forward_only=bool(sector_forward_only),
+                forward_cos_min=float(sector_forward_cos_min),
+                rotation_order=rotation_order,
+            )
+        a_bank, phi_bank_deg, theta_bank_deg = steering_cache[skey]
+
+        fit_vals_mode: List[float] = []
+        hats_mode: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+        extras_mode: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for rx_i in rx_indices:
+            ant_norms = np.linalg.norm(hi_mode[int(rx_i), :, :], axis=1)
+            ant_idx = int(np.argmax(ant_norms))
+            phi_hat, theta_hat, fit_val, steer_idx = estimate_angle_from_channel_scan(
+                hi_mode[int(rx_i), ant_idx, :],
+                a_bank,
+                phi_bank_deg,
+                theta_bank_deg,
+                scan_mode=scan_mode,
+                return_index=True,
+            )
+            if np.isfinite(fit_val):
+                fit_vals_mode.append(float(fit_val))
+
+            h_obs_mode = np.asarray(hi_mode[int(rx_i), int(ant_idx), :], dtype=np.complex128).reshape(-1)
+            if int(steer_idx) >= 0:
+                u_hat = np.asarray(a_bank[:, int(steer_idx)], dtype=np.complex128).reshape(-1)
+                den = np.vdot(u_hat, u_hat)
+                alpha_hat_mode = np.vdot(u_hat, h_obs_mode) / (den + 1e-12)
+                h_hat_vec_mode = alpha_hat_mode * u_hat
+            else:
+                u_hat = np.full((num_tx_ant,), np.nan + 1j * np.nan, dtype=np.complex128)
+                alpha_hat_mode = np.complex128(np.nan + 1j * np.nan)
+                h_hat_vec_mode = np.full((num_tx_ant,), np.nan + 1j * np.nan, dtype=np.complex128)
+
+            if channel_mode == "conj":
+                alpha_hat_raw = np.conj(alpha_hat_mode)
+                h_hat_vec_raw = np.conj(h_hat_vec_mode)
+            else:
+                alpha_hat_raw = alpha_hat_mode
+                h_hat_vec_raw = h_hat_vec_mode
+
+            if np.isfinite(phi_hat):
+                if bool(phi_mirror_about_sector):
+                    yaw_deg = 360.0 * float(sec_idx) / float(nsect_eff)
+                    phi_hat = float((2.0 * yaw_deg - float(phi_hat)) % 360.0)
+                phi_hat = float((phi_hat + phi_off) % 360.0)
+            hats_mode[(int(rx_i), int(t))] = (
+                float(phi_hat),
+                float(theta_hat),
+                float(score_user[int(rx_i)]),
+            )
+            extras_mode[(int(rx_i), int(t))] = {
+                "rx_ant_idx": int(ant_idx),
+                "steering_idx": int(steer_idx),
+                "u_hat": np.asarray(u_hat, dtype=np.complex128),
+                "alpha_hat_mode": np.complex128(alpha_hat_mode),
+                "alpha_hat_raw": np.complex128(alpha_hat_raw),
+                "h_hat_vec_mode": np.asarray(h_hat_vec_mode, dtype=np.complex128),
+                "h_hat_vec_raw": np.asarray(h_hat_vec_raw, dtype=np.complex128),
+            }
+
+        if len(fit_vals_mode) > 0:
+            fit_mean_mode = float(np.mean(fit_vals_mode))
+            fit_median_mode = float(np.median(fit_vals_mode))
+        else:
+            fit_mean_mode = float("nan")
+            fit_median_mode = float("nan")
+
+        candidate_fit_log.setdefault(ckey, []).append(
+            {
+                "fit_mean": float(fit_mean_mode),
+                "fit_median": float(fit_median_mode),
+                "fit_count": float(len(fit_vals_mode)),
+                "t": float(int(t)),
+            }
+        )
+
+        selected_mode_record.append(str(channel_mode))
+        selected_manifold_record.append(str(manifold_key))
+        selected_flatten_record.append(str(flatten_order))
+        selected_scan_record.append(str(scan_mode))
+        selected_phi_offset_record.append(float(phi_off))
+        selected_fit_record.append(float(fit_mean_mode))
+        num_sources_record.append(int(num_sources_est))
+
+        detected_rx_indices_by_tx[int(t)] = np.where(detected_mask_user)[0]
+
+        for rx_i in detected_rx_indices_by_tx[int(t)]:
+            key = (int(rx_i), int(t))
+            if key in hats_mode:
+                phi_hat, theta_hat, score = hats_mode[key]
+            else:
+                phi_hat, theta_hat, score = np.nan, np.nan, float(score_user[int(rx_i)])
+
+            prev = pair_hat.get(key)
+            if prev is None or float(score) > float(prev["score"]):
+                if prev is not None and "rx_ant_idx" in prev:
+                    old_ant = int(prev["rx_ant_idx"])
+                    if old_ant >= 0:
+                        h_hat_all_mode[int(rx_i), old_ant, int(t), :] = 0.0 + 0.0j
+                        h_hat_all_raw[int(rx_i), old_ant, int(t), :] = 0.0 + 0.0j
+
+                rec: Dict[str, Any] = {
+                    "score": float(score),
+                    "bs": int(t) // nsect_eff,
+                    "sec": int(t) % nsect_eff,
+                    "phi_hat_deg": float(phi_hat),
+                    "theta_hat_deg": float(theta_hat),
+                    "hat_mode": str(channel_mode),
+                    "manifold": str(manifold_key),
+                    "flatten": str(flatten_order),
+                    "scan": str(scan_mode),
+                    "phi_offset_deg": float(phi_off),
+                }
+                extra = extras_mode.get(key)
+                if extra is not None:
+                    rec["rx_ant_idx"] = int(extra["rx_ant_idx"])
+                    rec["steering_idx"] = int(extra["steering_idx"])
+                    rec["u_hat"] = np.asarray(extra["u_hat"], dtype=np.complex128)
+                    rec["alpha_hat_mode"] = np.complex128(extra["alpha_hat_mode"])
+                    rec["alpha_hat_raw"] = np.complex128(extra["alpha_hat_raw"])
+                    rec["h_hat_vec_mode"] = np.asarray(extra["h_hat_vec_mode"], dtype=np.complex128)
+                    rec["h_hat_vec_raw"] = np.asarray(extra["h_hat_vec_raw"], dtype=np.complex128)
+
+                    ant_idx_use = int(extra["rx_ant_idx"])
+                    if ant_idx_use >= 0:
+                        h_hat_all_mode[int(rx_i), ant_idx_use, int(t), :] = rec["h_hat_vec_mode"]
+                        h_hat_all_raw[int(rx_i), ant_idx_use, int(t), :] = rec["h_hat_vec_raw"]
+                pair_hat[key] = rec
+
+    det_pairs = sorted(pair_hat.keys(), key=lambda k: (k[1], k[0]))
+    if len(det_pairs) > 0:
+        pair_rx_idx = np.array([k[0] for k in det_pairs], dtype=int)
+        pair_t_idx = np.array([k[1] for k in det_pairs], dtype=int)
+        pair_bs_idx = np.array([pair_hat[k]["bs"] for k in det_pairs], dtype=int)
+        pair_sector_idx = np.array([pair_hat[k]["sec"] for k in det_pairs], dtype=int)
+        pair_phi_hat_deg = np.array([pair_hat[k]["phi_hat_deg"] for k in det_pairs], dtype=float)
+        pair_theta_hat_deg = np.array([pair_hat[k]["theta_hat_deg"] for k in det_pairs], dtype=float)
+        pair_rx_ant_idx = np.array([int(pair_hat[k].get("rx_ant_idx", -1)) for k in det_pairs], dtype=int)
+        pair_alpha_hat_mode = np.array(
+            [np.complex128(pair_hat[k].get("alpha_hat_mode", np.nan + 1j * np.nan)) for k in det_pairs],
+            dtype=np.complex128,
+        )
+        pair_alpha_hat_raw = np.array(
+            [np.complex128(pair_hat[k].get("alpha_hat_raw", np.nan + 1j * np.nan)) for k in det_pairs],
+            dtype=np.complex128,
+        )
+        nan_vec = np.full((num_tx_ant,), np.nan + 1j * np.nan, dtype=np.complex128)
+        pair_u_hat = np.vstack(
+            [
+                np.asarray(pair_hat[k].get("u_hat", nan_vec), dtype=np.complex128).reshape(1, -1)
+                for k in det_pairs
+            ]
+        )
+        pair_h_hat_vec_mode = np.vstack(
+            [
+                np.asarray(pair_hat[k].get("h_hat_vec_mode", nan_vec), dtype=np.complex128).reshape(1, -1)
+                for k in det_pairs
+            ]
+        )
+        pair_h_hat_vec_raw = np.vstack(
+            [
+                np.asarray(pair_hat[k].get("h_hat_vec_raw", nan_vec), dtype=np.complex128).reshape(1, -1)
+                for k in det_pairs
+            ]
+        )
+    else:
+        pair_rx_idx = np.empty((0,), dtype=int)
+        pair_t_idx = np.empty((0,), dtype=int)
+        pair_bs_idx = np.empty((0,), dtype=int)
+        pair_sector_idx = np.empty((0,), dtype=int)
+        pair_phi_hat_deg = np.empty((0,), dtype=float)
+        pair_theta_hat_deg = np.empty((0,), dtype=float)
+        pair_rx_ant_idx = np.empty((0,), dtype=int)
+        pair_alpha_hat_mode = np.empty((0,), dtype=np.complex128)
+        pair_alpha_hat_raw = np.empty((0,), dtype=np.complex128)
+        pair_u_hat = np.empty((0, num_tx_ant), dtype=np.complex128)
+        pair_h_hat_vec_mode = np.empty((0, num_tx_ant), dtype=np.complex128)
+        pair_h_hat_vec_raw = np.empty((0, num_tx_ant), dtype=np.complex128)
+
+    if len(detected_rx_indices_by_tx) > 0:
+        detected_rx_indices_unique = np.unique(np.concatenate(list(detected_rx_indices_by_tx.values())))
+    else:
+        detected_rx_indices_unique = np.empty((0,), dtype=int)
+
+    return {
+        "pair_hat": pair_hat,
+        "pair_rx_idx": pair_rx_idx,
+        "pair_t_idx": pair_t_idx,
+        "pair_bs_idx": pair_bs_idx,
+        "pair_sector_idx": pair_sector_idx,
+        "pair_phi_hat_deg": pair_phi_hat_deg,
+        "pair_theta_hat_deg": pair_theta_hat_deg,
+        "pair_rx_ant_idx": pair_rx_ant_idx,
+        "pair_u_hat": pair_u_hat,
+        "pair_alpha_hat_mode": pair_alpha_hat_mode,
+        "pair_alpha_hat_raw": pair_alpha_hat_raw,
+        "pair_h_hat_vec_mode": pair_h_hat_vec_mode,
+        "pair_h_hat_vec_raw": pair_h_hat_vec_raw,
+        "h_hat_all_mode": h_hat_all_mode,
+        "h_hat_all_raw": h_hat_all_raw,
+        "h_hat_all": h_hat_all_raw,
+        "selected_mode_record": np.asarray(selected_mode_record, dtype=object),
+        "selected_manifold_record": np.asarray(selected_manifold_record, dtype=object),
+        "selected_flatten_record": np.asarray(selected_flatten_record, dtype=object),
+        "selected_scan_record": np.asarray(selected_scan_record, dtype=object),
+        "selected_phi_offset_record": np.asarray(selected_phi_offset_record, dtype=float),
+        "selected_fit_record": np.asarray(selected_fit_record, dtype=float),
+        "num_sources_record": np.asarray(num_sources_record, dtype=int),
+        "candidate_metric_log": candidate_metric_log,
+        "candidate_fit_log": candidate_fit_log,
         "selected_metric_log": selected_metric_log,
         "detected_rx_indices_by_tx": detected_rx_indices_by_tx,
         "detected_rx_indices_unique": detected_rx_indices_unique,
