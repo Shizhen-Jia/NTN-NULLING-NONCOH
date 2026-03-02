@@ -114,8 +114,8 @@ class SceneConfigSionna:
         self.nsect = None              # Usually 3, for sector-based coverage
         # self.BS_height_above_roof = 35  # For base station on building
         # self.BS_height_above_ground = 45
-        self.BS_height_above_roof = 75  # For base station on building
-        self.BS_height_above_ground = 85
+        self.BS_height_above_roof = 45  # For base station on building
+        self.BS_height_above_ground = 55
         self.tn_height_above_roof = 1.2  # For base station on building
         self.tn_height_above_ground = 1.8
         self.ntn_height_above_roof = 1.2  # For base station on building
@@ -153,6 +153,10 @@ class SceneConfigSionna:
         self.tx_sector_index = None
         self.tx_orientation_rad = None
         self.tx_name_list = None
+        # Default BS sector orientation controls (can be overwritten from notebook)
+        self.tx_sector_yaw_offset_rad = 0.0
+        self.tx_sector_pitch_rad = -0.174533  # 10 deg down-tilt
+        self.tx_sector_roll_rad = 0.0
 
     def build_coverage_map(self, grid_size=None, show_xy=False, plot=False):
         """
@@ -530,14 +534,33 @@ class SceneConfigSionna:
 
     def compute_paths(self, nsect, fc, tx_rows = 8, tx_cols = 8, tn_rx_rows = 1, tn_rx_cols = 1, max_depth=3,
                       bandwidth=100e6, tx_power_dbm=30,
-                      sector_yaw_offset_rad=0.0,
-                      sector_pitch_rad=-0.174533,
-                      sector_roll_rad=0.0):
+                      sector_yaw_offset_rad=None,
+                      sector_pitch_rad=None,
+                      sector_roll_rad=None):
         """
         1) Configure scene frequency and remove old TX/RX
         2) Add TX, add TN array and receivers => compute TN CIR
         3) Remove TN, switch RX array to single-element custom => compute NTN CIR
+        sector_*_rad:
+            If None, use current object defaults:
+            self.tx_sector_yaw_offset_rad / self.tx_sector_pitch_rad / self.tx_sector_roll_rad.
         """
+        if sector_yaw_offset_rad is None:
+            sector_yaw_offset_rad = self.tx_sector_yaw_offset_rad
+        if sector_pitch_rad is None:
+            sector_pitch_rad = self.tx_sector_pitch_rad
+        if sector_roll_rad is None:
+            sector_roll_rad = self.tx_sector_roll_rad
+
+        sector_yaw_offset_rad = float(sector_yaw_offset_rad)
+        sector_pitch_rad = float(sector_pitch_rad)
+        sector_roll_rad = float(sector_roll_rad)
+
+        # Keep the latest values for future calls
+        self.tx_sector_yaw_offset_rad = sector_yaw_offset_rad
+        self.tx_sector_pitch_rad = sector_pitch_rad
+        self.tx_sector_roll_rad = sector_roll_rad
+
         self.fc = fc
         self.nsect = nsect
         self.scene.frequency = self.fc
