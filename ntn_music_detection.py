@@ -24,6 +24,93 @@ def _as_complex_array(x: np.ndarray) -> np.ndarray:
     return arr.astype(np.complex128) + 0j
 
 
+def collapse_cir_to_narrowband(cir: np.ndarray) -> np.ndarray:
+    """Collapse CIR to narrowband channel tensor with stable axis order.
+
+    Expected CIR axis order from Sionna:
+        [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps]
+    The function sums over all trailing axes after tx-ant, returning:
+        h_all.shape == (num_rx, num_rx_ant, num_tx, num_tx_ant)
+    """
+    h = _as_complex_array(cir)
+    if h.ndim < 4:
+        raise ValueError(
+            "cir must have at least 4 dims: "
+            "[num_rx, num_rx_ant, num_tx, num_tx_ant, ...]."
+        )
+    if h.ndim == 4:
+        return h
+    sum_axes = tuple(range(4, h.ndim))
+    return np.sum(h, axis=sum_axes)
+
+
+def extract_hi_for_tx(
+    h_all: np.ndarray,
+    tx_index: int,
+    *,
+    nonzero_only: bool = False,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract one TX tensor hi from h_all.
+
+    Parameters
+    ----------
+    h_all : np.ndarray
+        Shape (num_rx, num_rx_ant, num_tx, num_tx_ant).
+    tx_index : int
+        Flat TX index in [0, num_tx-1].
+    nonzero_only : bool
+        If True, keep only RX rows with any non-zero channel in hi.
+    eps : float
+        Threshold for non-zero check.
+
+    Returns
+    -------
+    hi : np.ndarray
+        Shape (num_rx_kept, num_rx_ant, num_tx_ant).
+    rx_mask : np.ndarray
+        Bool mask over original RX index, shape (num_rx,).
+    """
+    h = _as_complex_array(h_all)
+    if h.ndim != 4:
+        raise ValueError(
+            "h_all must have shape (num_rx, num_rx_ant, num_tx, num_tx_ant)."
+        )
+
+    num_rx, _num_rx_ant, num_tx, _num_tx_ant = h.shape
+    t = int(tx_index)
+    if t < 0 or t >= num_tx:
+        raise ValueError(f"tx_index={t} out of range for num_tx={num_tx}.")
+
+    hi = h[:, :, t, :]
+    if not nonzero_only:
+        return hi, np.ones((num_rx,), dtype=bool)
+
+    rx_mask = np.any(np.abs(hi) > float(eps), axis=(1, 2))
+    return hi[rx_mask], rx_mask
+
+
+def extract_tx_channel_matrix(
+    h_all: np.ndarray,
+    tx_index: int,
+    *,
+    rx_ant_index: int = 0,
+    nonzero_only: bool = False,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract per-TX matrix H_t for one RX antenna.
+
+    Returns H_t with shape (num_rx_kept, num_tx_ant), matching your
+    per-sector MUSIC input requirement like (100, 64).
+    """
+    hi, rx_mask = extract_hi_for_tx(h_all, tx_index, nonzero_only=nonzero_only, eps=eps)
+    num_rx_ant = hi.shape[1]
+    r = int(rx_ant_index)
+    if r < 0 or r >= num_rx_ant:
+        raise ValueError(f"rx_ant_index={r} out of range for num_rx_ant={num_rx_ant}.")
+    return hi[:, r, :], rx_mask
+
+
 def _broadcast_powers(
     user_powers: Optional[np.ndarray],
     num_ntn: int,
@@ -679,7 +766,19 @@ def estimate_angle_from_channel_scan(
     if a_bank.size == 0 or phi_bank_deg.size == 0:
         return float("nan"), float("nan"), float("nan")
 
+    a = _as_complex_array(a_bank)
+    if a.ndim != 2:
+        raise ValueError("a_bank must be a 2D matrix with shape (num_ant, num_grid).")
+
     h = _as_complex_array(h_user_vec).reshape(-1, 1)
+    if a.shape[0] != h.shape[0]:
+        raise ValueError(
+            f"Dimension mismatch: steering has {a.shape[0]} antennas, "
+            f"but h_user_vec has {h.shape[0]} elements."
+        )
+    if a.shape[1] != int(np.asarray(phi_bank_deg).size) or a.shape[1] != int(np.asarray(theta_bank_deg).size):
+        raise ValueError("a_bank column count must match phi_bank_deg/theta_bank_deg length.")
+
     nh = float(np.linalg.norm(h))
     if nh <= 1e-12:
         return float("nan"), float("nan"), float("nan")
@@ -690,10 +789,10 @@ def estimate_angle_from_channel_scan(
 
     if scan_mode == "complex":
         # A columns are normalized by construction.
-        corrs = np.abs((a_bank.conj().T @ h).reshape(-1))
+        corrs = np.abs((a.conj().T @ h).reshape(-1))
     else:
         # Phase-only matching is robust when element-pattern amplitudes distort h.
-        a_phase = np.exp(1j * np.angle(a_bank))
+        a_phase = np.exp(1j * np.angle(a))
         h_phase = np.exp(1j * np.angle(h))
         corrs = np.abs((a_phase.conj().T @ h_phase).reshape(-1))
 
@@ -708,6 +807,88 @@ def aod_to_aoa_reverse(phi_t_deg: np.ndarray, theta_t_deg: np.ndarray) -> Tuple[
     phi = (np.asarray(phi_t_deg, dtype=np.float64) + 180.0) % 360.0
     theta = 180.0 - np.asarray(theta_t_deg, dtype=np.float64)
     return phi, theta
+
+
+def zenith_to_elevation_deg(theta_zenith_deg: np.ndarray) -> np.ndarray:
+    """Convert zenith angle (0=+z, 90=horizontal) to elevation (0=horizontal)."""
+    return 90.0 - np.asarray(theta_zenith_deg, dtype=np.float64)
+
+
+def elevation_to_zenith_deg(theta_elevation_deg: np.ndarray) -> np.ndarray:
+    """Convert elevation angle (0=horizontal) to zenith (0=+z, 90=horizontal)."""
+    return 90.0 - np.asarray(theta_elevation_deg, dtype=np.float64)
+
+
+def sector_index_from_tx_index(tx_index: np.ndarray, nsect: int) -> np.ndarray:
+    """Map flat TX index to sector index."""
+    if int(nsect) <= 0:
+        raise ValueError("nsect must be > 0.")
+    return np.asarray(tx_index, dtype=np.int64) % int(nsect)
+
+
+def sector_yaw_offset_deg(sector_index: np.ndarray, nsect: int) -> np.ndarray:
+    """Sector azimuth offsets in degrees for equally-spaced sectors."""
+    if int(nsect) <= 0:
+        raise ValueError("nsect must be > 0.")
+    s = np.asarray(sector_index, dtype=np.float64)
+    return (360.0 * s / float(nsect)) % 360.0
+
+
+def sector_local_aod_to_global(
+    phi_local_deg: np.ndarray,
+    *,
+    sector_index: np.ndarray,
+    nsect: int,
+    yaw_offset_deg: float = 0.0,
+) -> np.ndarray:
+    """Convert per-sector local azimuth to global azimuth.
+
+    For 3-sector deployment, this applies +0/+120/+240 deg (plus optional offset).
+    """
+    phi_loc = np.asarray(phi_local_deg, dtype=np.float64)
+    sec = np.asarray(sector_index, dtype=np.float64)
+    if phi_loc.shape != sec.shape:
+        raise ValueError("phi_local_deg and sector_index must have the same shape.")
+
+    sec_off = sector_yaw_offset_deg(sec, int(nsect))
+    return (phi_loc + sec_off + float(yaw_offset_deg)) % 360.0
+
+
+def sionna_aod_to_uplink_aoa(
+    phi_t_deg: np.ndarray,
+    theta_t_deg: np.ndarray,
+    *,
+    phi_is_sector_local: bool = False,
+    sector_index: Optional[np.ndarray] = None,
+    nsect: Optional[int] = None,
+    yaw_offset_deg: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert Sionna downlink AOD reference to uplink AOA at BS.
+
+    - If phi_t is sector-local, set phi_is_sector_local=True and provide
+      sector_index + nsect to first convert it to global azimuth.
+    - Zenith angle conversion is always theta_aoa = 180 - theta_t.
+    """
+    phi_t = np.asarray(phi_t_deg, dtype=np.float64)
+    theta_t = np.asarray(theta_t_deg, dtype=np.float64)
+    if phi_t.shape != theta_t.shape:
+        raise ValueError("phi_t_deg and theta_t_deg must have the same shape.")
+
+    if phi_is_sector_local:
+        if sector_index is None or nsect is None:
+            raise ValueError(
+                "When phi_is_sector_local=True, sector_index and nsect are required."
+            )
+        phi_global = sector_local_aod_to_global(
+            phi_t,
+            sector_index=np.asarray(sector_index),
+            nsect=int(nsect),
+            yaw_offset_deg=float(yaw_offset_deg),
+        )
+    else:
+        phi_global = phi_t % 360.0
+
+    return aod_to_aoa_reverse(phi_global, theta_t)
 
 
 def wrapped_angle_diff_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> np.ndarray:

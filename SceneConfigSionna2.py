@@ -147,6 +147,10 @@ class SceneConfigSionna:
         self.h_tf = None
         self.tn_bs_index = None
         self.tn_sector_index = None
+        self.tx_bs_index = None
+        self.tx_sector_index = None
+        self.tx_orientation_rad = None
+        self.tx_name_list = None
 
     def build_coverage_map(self, grid_size=None, show_xy=False, plot=False):
         """
@@ -214,7 +218,7 @@ class SceneConfigSionna:
             plt.title("Building/Outdoor Map")
         plt.show()
 
-    def _snap_to_grid(self, x, y):
+    def _snap_to_grid(self, x, y, height_roof=None, height_ground=None):
         x = np.asarray(x)
         y = np.asarray(y)
         ix = np.searchsorted(self.cm.x, x)
@@ -222,12 +226,17 @@ class SceneConfigSionna:
         ix = np.clip(ix, 0, len(self.cm.x) - 1)
         iy = np.clip(iy, 0, len(self.cm.y) - 1)
 
+        if height_roof is None:
+            height_roof = self.BS_height_above_roof
+        if height_ground is None:
+            height_ground = self.BS_height_above_ground
+
         xg = self.cm.x[ix]
         yg = self.cm.y[iy]
         z = np.where(
             self.cm.bldg_grid[iy, ix],
-            self.cm.zmax_grid[iy, ix] + self.BS_height_above_roof,
-            self.cm.zmin_grid[iy, ix] + self.BS_height_above_ground
+            self.cm.zmax_grid[iy, ix] + height_roof,
+            self.cm.zmin_grid[iy, ix] + height_ground
         )
         return xg, yg, z
 
@@ -303,36 +312,9 @@ class SceneConfigSionna:
         elif self.nbs is None:
             raise ValueError("nbs is required when bs_grid is not set.")
 
-        x_limit_min = x_min + bs_dist_max
-        x_limit_max = x_max - bs_dist_max
-        y_limit_min = y_min + bs_dist_max
-        y_limit_max = y_max - bs_dist_max
-        x_coords = self.cm.x[locations_outdoor[:, 1]]
-        y_coords = self.cm.y[locations_outdoor[:, 0]]
-        mask = (
-            (x_coords >= x_limit_min) & (x_coords <= x_limit_max) &
-            (y_coords >= y_limit_min) & (y_coords <= y_limit_max)
-        )
-        locations_outdoor_limited = locations_outdoor[mask]
-        
-        tx_ind = locations_outdoor_limited[
-            np.random.choice(locations_outdoor_limited.shape[0], self.nbs, replace=False)
-        ]
-
-        # tx_ind = locations_outdoor[
-        #     np.random.choice(locations_outdoor.shape[0], self.nbs, replace=False)
-        # ]
-        
-
         # If centerBS = True and only 1 BS, force TX at (0, 0).
         if centerBS and self.nbs == 1:
-            tx_x = 0
-            tx_y = 0
-            tx_z = np.where(
-                self.cm.bldg_grid[tx_x, tx_y],
-                self.cm.zmax_grid[tx_x, tx_y] + self.BS_height_above_roof,
-                self.cm.zmin_grid[tx_x, tx_y] + self.BS_height_above_ground
-            )
+            tx_x, tx_y, tx_z = self._snap_to_grid(np.array([0.0]), np.array([0.0]))
         elif bs_grid is not None:
             x_start = x_min + bs_boundary
             x_end = x_max - bs_boundary
@@ -356,6 +338,32 @@ class SceneConfigSionna:
             tx_y = np.zeros_like(tx_x)
             tx_x, tx_y, tx_z = self._snap_to_grid(tx_x, tx_y)
         else:
+            x_limit_min = x_min + bs_dist_max
+            x_limit_max = x_max - bs_dist_max
+            y_limit_min = y_min + bs_dist_max
+            y_limit_max = y_max - bs_dist_max
+            x_coords = self.cm.x[locations_outdoor[:, 1]]
+            y_coords = self.cm.y[locations_outdoor[:, 0]]
+            mask = (
+                (x_coords >= x_limit_min) & (x_coords <= x_limit_max) &
+                (y_coords >= y_limit_min) & (y_coords <= y_limit_max)
+            )
+            locations_outdoor_limited = locations_outdoor[mask]
+
+            # Prefer interior outdoor points; if too few, gracefully fall back.
+            if locations_outdoor_limited.shape[0] >= self.nbs:
+                tx_candidates = locations_outdoor_limited
+            elif locations_outdoor.shape[0] > 0:
+                tx_candidates = locations_outdoor
+            elif locations_building.shape[0] > 0:
+                tx_candidates = locations_building
+            else:
+                raise ValueError("No valid grid points available to place BS.")
+
+            replace = tx_candidates.shape[0] < self.nbs
+            tx_ind = tx_candidates[
+                np.random.choice(tx_candidates.shape[0], self.nbs, replace=replace)
+            ]
             tx_x = self.cm.x[tx_ind[:,1]]
             tx_y = self.cm.y[tx_ind[:,0]]
             tx_z = np.where(
@@ -458,7 +466,12 @@ class SceneConfigSionna:
             tn_xy = (bs_xy[:, None, :] + offsets[None, :, :]).reshape(-1, 2)
             tn_x = np.clip(tn_xy[:, 0], x_min, x_max)
             tn_y = np.clip(tn_xy[:, 1], y_min, y_max)
-            tn_x, tn_y, tn_z = self._snap_to_grid(tn_x, tn_y)
+            tn_x, tn_y, tn_z = self._snap_to_grid(
+                tn_x,
+                tn_y,
+                height_roof=self.tn_height_above_roof,
+                height_ground=self.tn_height_above_ground,
+            )
             self.tn_pos = np.column_stack((tn_x, tn_y, tn_z))
         elif tn_building_ratio is None:
             # Random TN from all grid points
@@ -514,7 +527,10 @@ class SceneConfigSionna:
         
 
     def compute_paths(self, nsect, fc, tx_rows = 8, tx_cols = 8, tn_rx_rows = 1, tn_rx_cols = 1, max_depth=3,
-                      bandwidth=100e6, tx_power_dbm=30):
+                      bandwidth=100e6, tx_power_dbm=30,
+                      sector_yaw_offset_rad=0.0,
+                      sector_pitch_rad=-0.174533,
+                      sector_roll_rad=0.0):
         """
         1) Configure scene frequency and remove old TX/RX
         2) Add TX, add TN array and receivers => compute TN CIR
@@ -527,9 +543,9 @@ class SceneConfigSionna:
         self.scene.synthetic_array = True
 
         # Remove existing TX and RX
-        for rx_name in self.scene.receivers:
+        for rx_name in list(self.scene.receivers):
             self.scene.remove(rx_name)
-        for tx_name in self.scene.transmitters:
+        for tx_name in list(self.scene.transmitters):
             self.scene.remove(tx_name)
 
         # A. Set up the TX array
@@ -555,16 +571,33 @@ class SceneConfigSionna:
 
         # (1) Add Transmitters
         #    Use multiple sector approach for the single base station
+        sector_yaw = np.mod(
+            float(sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
+            2.0 * np.pi,
+        )
+        tx_name_list = []
+        tx_bs_index = []
+        tx_sector_index = []
+        tx_orientation = []
         for i in range(self.nbs):
             for s in range(self.nsect):
-                yaw = 2.0 * np.pi * s / self.nsect
+                yaw = float(sector_yaw[s])
+                name = f"tx-{i}-{s}"
                 tx = sionna.rt.Transmitter(
-                    name=f"tx-{i}-{s}",
+                    name=name,
                     position=self.tx_pos[i],
                     power_dbm=tx_power_dbm,
-                    orientation=[yaw, -0.0873 , 0] # headdown 10 degree,  -0.0873
+                    orientation=[yaw, float(sector_pitch_rad), float(sector_roll_rad)]
                 )
                 self.scene.add(tx)
+                tx_name_list.append(name)
+                tx_bs_index.append(int(i))
+                tx_sector_index.append(int(s))
+                tx_orientation.append([yaw, float(sector_pitch_rad), float(sector_roll_rad)])
+        self.tx_name_list = tx_name_list
+        self.tx_bs_index = np.asarray(tx_bs_index, dtype=int)
+        self.tx_sector_index = np.asarray(tx_sector_index, dtype=int)
+        self.tx_orientation_rad = np.asarray(tx_orientation, dtype=float)
 
         # (2) Add TN Receivers
         # Pair each TN with nearest BS and store index + sector index
@@ -578,7 +611,10 @@ class SceneConfigSionna:
         tn_xy = self.tn_pos[:, :2]
         rel = tn_xy - bs_xy[self.tn_bs_index]
         ang = np.mod(np.arctan2(rel[:, 1], rel[:, 0]), 2*np.pi)
-        sector_yaw = 2.0 * np.pi * np.arange(self.nsect) / self.nsect
+        sector_yaw = np.mod(
+            float(sector_yaw_offset_rad) + 2.0 * np.pi * np.arange(self.nsect) / self.nsect,
+            2.0 * np.pi,
+        )
         # nearest sector center (circular distance)
         dtheta = np.abs(ang[:, None] - sector_yaw[None, :])
         dtheta = np.minimum(dtheta, 2*np.pi - dtheta)
@@ -609,7 +645,7 @@ class SceneConfigSionna:
         self.a_tn, self.tau_tn = self.paths_tn.cir(normalize_delays=False, out_type="numpy")
 
         if self.ntn_rx > 0:
-            for rx_name in self.scene.receivers:
+            for rx_name in list(self.scene.receivers):
                 self.scene.remove(rx_name)
 
             self.scene.rx_array = PlanarArray(
