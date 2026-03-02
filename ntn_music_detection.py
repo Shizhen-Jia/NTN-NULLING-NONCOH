@@ -169,7 +169,7 @@ def _sample_covariance_from_snapshots(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate synthetic snapshots and return (Rxx, X).
 
-    - No QAM order is required here; symbols are circular Gaussian CN(0, 1).
+    - symbols are circular Gaussian CN(0, 1).
     - This is standard for subspace estimation and is modulation-agnostic.
     """
     num_ntn, num_ntn_ant, num_bs_ant = hi.shape
