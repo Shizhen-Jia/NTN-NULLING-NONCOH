@@ -6,7 +6,12 @@ from typing import Any, Dict, Iterable, List, Tuple
 import numpy as np
 
 from BeamformingCalc import nulling_bf_music_noncoh, svd_bf
-from ntn_music_detection import collapse_cir_to_narrowband, run_music_standard_pipeline
+from ntn_music_detection import (
+    build_ntn_truth_from_paths,
+    collapse_cir_to_narrowband,
+    run_music_standard_pipeline,
+    summarize_ntn_music_quality,
+)
 
 
 def _safe_db(power_linear: np.ndarray | float, eps: float = 1e-12) -> np.ndarray | float:
@@ -269,6 +274,8 @@ def run_nulling_cdf_experiment(
     tx_power: float,
     noise_power: float,
     music_kwargs: Dict[str, Any],
+    sionna_phi_is_global: bool = True,
+    theta_display_mode: str = "elevation",
     eps: float = 1e-12,
     plot_first_sim_only: bool = True,
     show_progress: bool = True,
@@ -334,6 +341,20 @@ def run_nulling_cdf_experiment(
             h_ntn_all,
             **music_kwargs,
         )
+        ntn_truth = build_ntn_truth_from_paths(
+            scene_config.paths_ntn,
+            scene_config.a_ntn,
+            num_tx_total=num_tx_total,
+            nsect=int(music_kwargs["nsect"]),
+            sionna_phi_is_global=bool(sionna_phi_is_global),
+        )
+        music_quality = summarize_ntn_music_quality(
+            h_ntn_all,
+            ntn_music_out,
+            ntn_truth["pair_map"],
+            theta_display_mode=str(theta_display_mode),
+            eps=eps,
+        )
         music_lookup = build_music_tx_lookup(
             ntn_music_out,
             num_ntn_rx=num_ntn_rx,
@@ -352,6 +373,9 @@ def run_nulling_cdf_experiment(
                 "pair_counts_by_tx": pair_counts_by_tx.copy(),
                 "detected_ntn_count": int(detected_rx_union.size),
                 "interfered_ntn_count": interfered_ntn_count,
+                "angle_metrics": music_quality["angle_metrics"],
+                "detected_subset_metrics": music_quality["detected_subset_metrics"],
+                "detected_pairs_summary": music_quality["detected_pairs_summary"],
             }
         )
 
@@ -391,83 +415,6 @@ def run_nulling_cdf_experiment(
     }
 
 
-def _lambda_label(lambda_: float) -> str:
-    return f"$\\lambda={float(lambda_):.0e}$"
-
-
-def plot_ieee_single_column_cdf(
-    raw_values: np.ndarray,
-    null_values_by_lambda: Dict[float, np.ndarray],
-    *,
-    xlabel: str,
-    output_stem: str,
-    result_dir: str | Path = "result",
-    ylabel: str = "CDF",
-) -> Dict[str, Any]:
-    """Plot and save one IEEE single-column CDF figure."""
-    import matplotlib.pyplot as plt
-
-    result_path = Path(result_dir)
-    result_path.mkdir(parents=True, exist_ok=True)
-
-    plt.rcParams.update(
-        {
-            "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-            "font.size": 8,
-            "axes.labelsize": 8,
-            "axes.titlesize": 8,
-            "legend.fontsize": 7,
-            "xtick.labelsize": 7,
-            "ytick.labelsize": 7,
-            "lines.linewidth": 1.4,
-        }
-    )
-
-    fig, ax = plt.subplots(figsize=(3.5, 2.6))
-    raw = np.asarray(raw_values, dtype=np.float64)
-    raw = raw[np.isfinite(raw)]
-    if raw.size > 0:
-        raw_sorted = np.sort(raw)
-        raw_cdf = np.arange(1, raw_sorted.size + 1, dtype=np.float64) / float(raw_sorted.size)
-        ax.plot(raw_sorted, raw_cdf, color="black", linestyle="-", label="No nulling")
-
-    color_cycle = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#8c564b", "#17becf"]
-    style_cycle = ["--", "-.", ":", (0, (4, 1, 1, 1)), (0, (6, 2)), (0, (3, 1, 1, 1, 1, 1))]
-    for idx, lambda_ in enumerate(sorted(null_values_by_lambda.keys())):
-        vals = np.asarray(null_values_by_lambda[lambda_], dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
-        vals_sorted = np.sort(vals)
-        vals_cdf = np.arange(1, vals_sorted.size + 1, dtype=np.float64) / float(vals_sorted.size)
-        ax.plot(
-            vals_sorted,
-            vals_cdf,
-            color=color_cycle[idx % len(color_cycle)],
-            linestyle=style_cycle[idx % len(style_cycle)],
-            label=_lambda_label(lambda_),
-        )
-
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
-    ax.set_ylim(0.0, 1.0)
-    ax.legend(loc="lower right", frameon=True)
-    fig.tight_layout(pad=0.2)
-
-    png_path = result_path / f"{output_stem}.png"
-    pdf_path = result_path / f"{output_stem}.pdf"
-    fig.savefig(png_path, dpi=400, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
-    return {
-        "fig": fig,
-        "ax": ax,
-        "png_path": png_path,
-        "pdf_path": pdf_path,
-    }
-
-
 def save_experiment_metrics(
     experiment_out: Dict[str, Any],
     *,
@@ -504,6 +451,58 @@ def save_experiment_metrics(
         save_dict["macro_stats_pair_counts_by_tx"] = np.stack(
             [np.asarray(row["pair_counts_by_tx"], dtype=int) for row in macro_stats],
             axis=0,
+        )
+        save_dict["macro_stats_phi_mae_deg"] = np.asarray(
+            [row.get("angle_metrics", {}).get("phi_mae_deg", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_elev_mae_deg"] = np.asarray(
+            [row.get("angle_metrics", {}).get("elev_mae_deg", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_angle_match_count"] = np.asarray(
+            [row.get("angle_metrics", {}).get("matched_pairs", 0) for row in macro_stats],
+            dtype=int,
+        )
+        save_dict["macro_stats_detected_subset_count"] = np.asarray(
+            [row.get("detected_subset_metrics", {}).get("count", 0) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_subset_nrmse"] = np.asarray(
+            [row.get("detected_subset_metrics", {}).get("nrmse", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_subset_cos_sim"] = np.asarray(
+            [row.get("detected_subset_metrics", {}).get("cos_sim", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_subset_mag_mae"] = np.asarray(
+            [row.get("detected_subset_metrics", {}).get("mag_mae", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_subset_power_ratio_db"] = np.asarray(
+            [row.get("detected_subset_metrics", {}).get("power_ratio_db", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_pairs_count"] = np.asarray(
+            [row.get("detected_pairs_summary", {}).get("pairs", 0) for row in macro_stats],
+            dtype=int,
+        )
+        save_dict["macro_stats_detected_pairs_nrmse_mean"] = np.asarray(
+            [row.get("detected_pairs_summary", {}).get("nrmse_mean", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_pairs_nrmse_median"] = np.asarray(
+            [row.get("detected_pairs_summary", {}).get("nrmse_median", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_pairs_cos_mean"] = np.asarray(
+            [row.get("detected_pairs_summary", {}).get("cos_mean", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_detected_pairs_cos_median"] = np.asarray(
+            [row.get("detected_pairs_summary", {}).get("cos_median", np.nan) for row in macro_stats],
+            dtype=np.float64,
         )
 
     np.savez(save_path, **save_dict)

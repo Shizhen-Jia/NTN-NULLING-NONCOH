@@ -24,6 +24,11 @@ def _as_complex_array(x: np.ndarray) -> np.ndarray:
     return arr.astype(np.complex128) + 0j
 
 
+def _to_numpy(x: Any) -> np.ndarray:
+    """Convert tensor-like objects to NumPy arrays without changing values."""
+    return x.numpy() if hasattr(x, "numpy") else np.asarray(x)
+
+
 def collapse_cir_to_narrowband(cir: np.ndarray) -> np.ndarray:
     """Collapse CIR to narrowband channel tensor with stable axis order.
 
@@ -1077,6 +1082,335 @@ def build_true_pair_map(
             pair_bs_idx,
             pair_sector_idx,
         )
+    }
+
+
+def _canonical_rx_tx_paths(arr: np.ndarray, num_tx: int) -> np.ndarray:
+    """Reorder path tensors to shape [num_rx, num_tx, num_paths_flat]."""
+    a = np.squeeze(_to_numpy(arr))
+    if a.ndim < 2:
+        raise ValueError(f"Need >=2 dims for [rx,tx], got {a.shape}")
+    tx_axes = [i for i, s in enumerate(a.shape) if s == num_tx]
+    if not tx_axes:
+        raise ValueError(f"Cannot find tx-axis size={num_tx} in {a.shape}")
+    tx_axis = tx_axes[1] if (tx_axes[0] == 0 and len(tx_axes) > 1) else tx_axes[0]
+    a = np.moveaxis(a, [0, tx_axis], [0, 1])
+    return a.reshape(a.shape[0], a.shape[1], -1)
+
+
+def _pair_and_path_power(
+    cir: np.ndarray,
+    num_tx: int,
+    num_paths: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return pair power and per-path power with stable [rx, tx, path] indexing."""
+    h = _to_numpy(cir)
+    tx_axes = [i for i, s in enumerate(h.shape) if s == num_tx]
+    if not tx_axes:
+        raise ValueError(f"Cannot find tx-axis size={num_tx} in cir shape={h.shape}")
+    tx_axis = tx_axes[1] if (tx_axes[0] == 0 and len(tx_axes) > 1) else tx_axes[0]
+
+    h_rt = np.moveaxis(h, [0, tx_axis], [0, 1])
+    pwr = np.abs(h_rt) ** 2
+    pair_power = pwr.sum(axis=tuple(range(2, pwr.ndim)))
+
+    rest = h_rt.shape[2:]
+    path_cands = [i for i, s in enumerate(rest) if s == num_paths]
+    if not path_cands:
+        if num_paths == 1:
+            return pair_power, pair_power[..., None]
+        raise ValueError(f"Cannot align path axis: num_paths={num_paths}, cir_rest={rest}")
+
+    pick = path_cands[-1]
+    if len(path_cands) > 1 and pick == len(rest) - 1:
+        pick = path_cands[-2]
+
+    path_axis = 2 + pick
+    sum_axes = tuple(ax for ax in range(2, h_rt.ndim) if ax != path_axis)
+    path_power = pwr.sum(axis=sum_axes)
+    return pair_power, path_power
+
+
+def build_ntn_truth_from_paths(
+    paths_ntn: Any,
+    cir_ntn: np.ndarray,
+    *,
+    num_tx_total: int,
+    nsect: int,
+    sionna_phi_is_global: bool = True,
+    channel_eps: float = 1e-18,
+    angle_eps_deg: float = 1e-9,
+) -> Dict[str, Any]:
+    """Extract strongest-path NTN truth pairs from Sionna path outputs.
+
+    For each valid `(rx, tx)` pair, the function keeps the strongest path and
+    records its AOD angles. The resulting map is used to evaluate MUSIC angle
+    estimates per macro simulation.
+    """
+    if not hasattr(paths_ntn, "phi_t") or not hasattr(paths_ntn, "theta_t"):
+        raise AttributeError("paths_ntn must provide phi_t and theta_t.")
+
+    phi_probe = np.squeeze(_to_numpy(paths_ntn.phi_t))
+    num_tx_eff = int(num_tx_total)
+    if num_tx_eff not in phi_probe.shape:
+        if phi_probe.ndim >= 2:
+            tx_dims = [int(s) for s in phi_probe.shape if int(s) > 1]
+            if num_tx_eff in tx_dims:
+                pass
+            elif len(tx_dims) > 0:
+                num_tx_eff = int(max(tx_dims))
+
+    phi_t = _canonical_rx_tx_paths(paths_ntn.phi_t, num_tx_eff)
+    theta_t = _canonical_rx_tx_paths(paths_ntn.theta_t, num_tx_eff)
+    phi_t_raw_deg = np.mod(np.rad2deg(phi_t), 360.0)
+    theta_t_deg = np.rad2deg(theta_t)
+    tx_sector_map = sector_index_from_tx_index(np.arange(num_tx_eff), int(nsect))
+
+    if sionna_phi_is_global:
+        phi_t_deg = phi_t_raw_deg
+    else:
+        phi_t_deg = sector_local_aod_to_global(
+            phi_t_raw_deg,
+            sector_index=np.broadcast_to(tx_sector_map[None, :, None], phi_t_raw_deg.shape),
+            nsect=int(nsect),
+        )
+
+    pair_power_ntn, path_power_ntn = _pair_and_path_power(cir_ntn, num_tx_eff, phi_t_deg.shape[2])
+    angle_nonzero_pair_mask = np.any(
+        (np.abs(phi_t_deg) > float(angle_eps_deg)) | (np.abs(theta_t_deg) > float(angle_eps_deg)),
+        axis=2,
+    )
+    channel_nonzero_pair_mask = pair_power_ntn > float(channel_eps)
+    valid_pair_mask = angle_nonzero_pair_mask & channel_nonzero_pair_mask
+
+    valid_pairs = np.argwhere(valid_pair_mask)
+    if valid_pairs.size > 0:
+        rx_idx_valid = valid_pairs[:, 0]
+        t_idx_valid = valid_pairs[:, 1]
+        pair_best_path = np.argmax(path_power_ntn[rx_idx_valid, t_idx_valid, :], axis=1)
+        pair_phi_t_deg = phi_t_deg[rx_idx_valid, t_idx_valid, pair_best_path]
+        pair_theta_t_deg = theta_t_deg[rx_idx_valid, t_idx_valid, pair_best_path]
+        pair_bs_idx = t_idx_valid // int(nsect)
+        pair_sector_idx = t_idx_valid % int(nsect)
+    else:
+        rx_idx_valid = np.empty((0,), dtype=int)
+        t_idx_valid = np.empty((0,), dtype=int)
+        pair_best_path = np.empty((0,), dtype=int)
+        pair_phi_t_deg = np.empty((0,), dtype=float)
+        pair_theta_t_deg = np.empty((0,), dtype=float)
+        pair_bs_idx = np.empty((0,), dtype=int)
+        pair_sector_idx = np.empty((0,), dtype=int)
+
+    return {
+        "pair_rx_idx": rx_idx_valid,
+        "pair_t_idx": t_idx_valid,
+        "pair_bs_idx": pair_bs_idx,
+        "pair_sector_idx": pair_sector_idx,
+        "pair_path_idx": pair_best_path,
+        "pair_phi_t_deg": pair_phi_t_deg,
+        "pair_theta_t_deg": pair_theta_t_deg,
+        "pair_map": build_true_pair_map(
+            rx_idx_valid,
+            t_idx_valid,
+            pair_phi_t_deg,
+            pair_theta_t_deg,
+            pair_bs_idx,
+            pair_sector_idx,
+        ),
+        "valid_pair_count": int(valid_pairs.shape[0]),
+    }
+
+
+def _vector_error_metrics(
+    x_hat: np.ndarray,
+    x_true: np.ndarray,
+    eps: float = 1e-12,
+) -> Dict[str, float]:
+    """Compute reconstruction metrics for one tensor or one flattened vector.
+
+    Metric notes:
+    - `NRMSE` is `||x_hat - x_true|| / ||x_true||`; lower is better.
+    - `CosSim` is normalized complex-vector similarity in `[0, 1]`; higher is better.
+    - `|h| MAE` is mean absolute error on channel magnitude.
+    - `PowerRatio` is `10*log10(sum|x_hat|^2 / sum|x_true|^2)`; `0 dB` is ideal.
+    """
+    xh = np.asarray(x_hat, dtype=np.complex128).reshape(-1)
+    xt = np.asarray(x_true, dtype=np.complex128).reshape(-1)
+    if xh.size == 0:
+        return {
+            "count": 0.0,
+            "nrmse": float("nan"),
+            "cos_sim": float("nan"),
+            "mag_mae": float("nan"),
+            "power_ratio_db": float("nan"),
+        }
+
+    err = xh - xt
+    nrmse = np.linalg.norm(err) / (np.linalg.norm(xt) + float(eps))
+    cos_sim = np.abs(np.vdot(xh, xt)) / (np.linalg.norm(xh) * np.linalg.norm(xt) + float(eps))
+    mag_mae = np.mean(np.abs(np.abs(xh) - np.abs(xt)))
+    p_hat = np.sum(np.abs(xh) ** 2)
+    p_true = np.sum(np.abs(xt) ** 2)
+    power_ratio_db = 10.0 * np.log10((p_hat + float(eps)) / (p_true + float(eps)))
+    return {
+        "count": float(xh.size),
+        "nrmse": float(nrmse),
+        "cos_sim": float(cos_sim),
+        "mag_mae": float(mag_mae),
+        "power_ratio_db": float(power_ratio_db),
+    }
+
+
+def summarize_ntn_music_quality(
+    h_ntn_all: np.ndarray,
+    ntn_music_out: Dict[str, Any],
+    ntn_true_map: Optional[Dict[Tuple[int, int], Tuple[float, float, int, int]]] = None,
+    *,
+    theta_display_mode: Literal["zenith", "elevation"] = "elevation",
+    eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """Summarize MUSIC angle and channel reconstruction quality.
+
+    Returned groups:
+    - `angle_metrics`: matched detected-pair angle error against strongest-path truth.
+    - `detected_subset_metrics`: compare the full estimated tensor `h_hat_all` against
+      the true tensor `h_ntn_all`, restricted to detected NTN users only.
+    - `detected_pairs_summary`: compare each detected `(rx, tx, rx_ant)` channel vector
+      independently, then report mean/median statistics across detected pairs.
+
+    This matches the interpretation used in the earlier notebook validation cells:
+    - `Detected-subset tensor metrics` describe aggregate tensor reconstruction quality.
+    - `Detected pairs summary` describes per-link reconstruction quality.
+    """
+    h_ntn_all_np = np.asarray(h_ntn_all, dtype=np.complex128)
+    h_ntn_hat_all_np = np.asarray(
+        ntn_music_out.get("h_hat_all", np.zeros_like(h_ntn_all_np)),
+        dtype=np.complex128,
+    )
+    if h_ntn_hat_all_np.shape != h_ntn_all_np.shape:
+        raise ValueError(
+            f"Shape mismatch: h_hat_all{h_ntn_hat_all_np.shape} vs h_ntn_all{h_ntn_all_np.shape}"
+        )
+
+    true_map = ntn_true_map if ntn_true_map is not None else {}
+    pair_hat = ntn_music_out.get("pair_hat", {})
+    det_pairs = sorted(pair_hat.keys(), key=lambda k: (k[1], k[0]))
+    matched_pairs = [k for k in det_pairs if k in true_map]
+
+    if len(matched_pairs) > 0:
+        phi_true_match = np.array([true_map[k][0] for k in matched_pairs], dtype=float)
+        theta_true_match = np.array([true_map[k][1] for k in matched_pairs], dtype=float)
+        phi_hat_match = np.array([pair_hat[k]["phi_hat_deg"] for k in matched_pairs], dtype=float)
+        theta_hat_match = np.array([pair_hat[k]["theta_hat_deg"] for k in matched_pairs], dtype=float)
+
+        theta_mode = str(theta_display_mode).strip().lower()
+        if theta_mode == "elevation":
+            theta_true_metric = zenith_to_elevation_deg(theta_true_match)
+            theta_hat_metric = zenith_to_elevation_deg(theta_hat_match)
+            theta_label = "elev"
+        elif theta_mode == "zenith":
+            theta_true_metric = theta_true_match
+            theta_hat_metric = theta_hat_match
+            theta_label = "theta"
+        else:
+            raise ValueError("theta_display_mode must be 'zenith' or 'elevation'.")
+
+        angle_metrics = angle_error_metrics(
+            phi_true_match,
+            theta_true_metric,
+            phi_hat_match,
+            theta_hat_metric,
+            reference_mode="aod",
+        )
+        angle_metrics["theta_metric_name"] = theta_label
+        angle_metrics["matched_pairs"] = int(len(matched_pairs))
+        angle_metrics["elev_mae_deg"] = (
+            float(angle_metrics["theta_mae_deg"]) if theta_label == "elev" else float("nan")
+        )
+    else:
+        angle_metrics = {
+            "count": 0.0,
+            "matched_pairs": 0,
+            "phi_mae_deg": float("nan"),
+            "phi_std_deg": float("nan"),
+            "theta_mae_deg": float("nan"),
+            "theta_std_deg": float("nan"),
+            "theta_metric_name": "elev" if str(theta_display_mode).lower() == "elevation" else "theta",
+            "elev_mae_deg": float("nan"),
+        }
+
+    pair_rx = np.asarray(ntn_music_out.get("pair_rx_idx", []), dtype=int)
+    if pair_rx.size == 0:
+        det_rx_idx = np.asarray(ntn_music_out.get("detected_rx_indices_unique", []), dtype=int)
+    else:
+        det_rx_idx = np.unique(pair_rx)
+    det_rx_idx = det_rx_idx[(det_rx_idx >= 0) & (det_rx_idx < h_ntn_all_np.shape[0])]
+    det_rx_idx = np.unique(det_rx_idx)
+
+    if det_rx_idx.size == 0:
+        detected_subset_metrics = {
+            "count": 0.0,
+            "nrmse": float("nan"),
+            "cos_sim": float("nan"),
+            "mag_mae": float("nan"),
+            "power_ratio_db": float("nan"),
+        }
+    else:
+        detected_subset_metrics = _vector_error_metrics(
+            h_ntn_hat_all_np[det_rx_idx, :, :, :],
+            h_ntn_all_np[det_rx_idx, :, :, :],
+            eps=eps,
+        )
+
+    pair_t = np.asarray(ntn_music_out.get("pair_t_idx", []), dtype=int)
+    if "pair_rx_ant_idx" in ntn_music_out:
+        pair_ant = np.asarray(ntn_music_out.get("pair_rx_ant_idx", []), dtype=int)
+    else:
+        pair_ant = np.zeros((pair_rx.size,), dtype=int)
+
+    valid = (
+        (pair_rx >= 0)
+        & (pair_rx < h_ntn_all_np.shape[0])
+        & (pair_t >= 0)
+        & (pair_t < h_ntn_all_np.shape[2])
+        & (pair_ant >= 0)
+        & (pair_ant < h_ntn_all_np.shape[1])
+    )
+
+    pair_nrmse: List[float] = []
+    pair_cos: List[float] = []
+    for rx_i, ant_i, t_i in zip(pair_rx[valid], pair_ant[valid], pair_t[valid]):
+        h_hat_vec = h_ntn_hat_all_np[int(rx_i), int(ant_i), int(t_i), :]
+        h_true_vec = h_ntn_all_np[int(rx_i), int(ant_i), int(t_i), :]
+        metrics = _vector_error_metrics(h_hat_vec, h_true_vec, eps=eps)
+        pair_nrmse.append(float(metrics["nrmse"]))
+        pair_cos.append(float(metrics["cos_sim"]))
+
+    pair_nrmse_arr = np.asarray(pair_nrmse, dtype=np.float64)
+    pair_cos_arr = np.asarray(pair_cos, dtype=np.float64)
+    if pair_nrmse_arr.size > 0:
+        detected_pairs_summary = {
+            "pairs": int(pair_nrmse_arr.size),
+            "nrmse_mean": float(np.mean(pair_nrmse_arr)),
+            "nrmse_median": float(np.median(pair_nrmse_arr)),
+            "cos_mean": float(np.mean(pair_cos_arr)),
+            "cos_median": float(np.median(pair_cos_arr)),
+        }
+    else:
+        detected_pairs_summary = {
+            "pairs": 0,
+            "nrmse_mean": float("nan"),
+            "nrmse_median": float("nan"),
+            "cos_mean": float("nan"),
+            "cos_median": float("nan"),
+        }
+
+    return {
+        "angle_metrics": angle_metrics,
+        "detected_subset_metrics": detected_subset_metrics,
+        "detected_pairs_summary": detected_pairs_summary,
+        "detected_rx_indices": det_rx_idx,
+        "matched_pairs": matched_pairs,
     }
 
 
