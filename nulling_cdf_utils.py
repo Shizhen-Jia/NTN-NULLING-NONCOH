@@ -50,7 +50,7 @@ def pair_tn_to_strongest_tx(
     h_tn_th: float,
     tx_antennas: int,
     tx_power: float,
-    noise_power: float,
+    snr_noise_power: float,
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """Pair each TN to its strongest valid TX over all BS sectors.
@@ -86,7 +86,11 @@ def pair_tn_to_strongest_tx(
 
         h_tn = np.asarray(h[tn_idx, :, tx_local_best, :], dtype=np.complex128).T
         w_t, w_r = svd_bf(h_tn, tx_antennas)
-        snr_raw_linear = np.abs((w_t.conj().T @ h_tn @ w_r).item()) ** 2 * float(tx_power) / float(noise_power)
+        snr_raw_linear = (
+            np.abs((w_t.conj().T @ h_tn @ w_r).item()) ** 2
+            * float(tx_power)
+            / float(snr_noise_power)
+        )
 
         pairs_by_tx[int(tx_local_best)].append(
             {
@@ -189,7 +193,8 @@ def run_small_round(
     round_idx: int,
     lambda_ranges: Iterable[float],
     tx_power: float,
-    noise_power: float,
+    snr_noise_power: float,
+    inr_noise_power: float,
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """Run one small simulation round where every TX serves one paired TN."""
@@ -234,18 +239,25 @@ def run_small_round(
 
         for lambda_ in lambda_list:
             v_null, _, _, _ = nulling_bf_music_noncoh(h_tn, w_r, u_t, g_t, lambda_, eps=eps)
-            null_snr_linear = np.abs((v_null.conj().T @ h_tn @ w_r).item()) ** 2 * float(tx_power) / float(noise_power)
+            null_snr_linear = (
+                np.abs((v_null.conj().T @ h_tn @ w_r).item()) ** 2
+                * float(tx_power)
+                / float(snr_noise_power)
+            )
             null_snr_db[lambda_].append(float(_safe_db(null_snr_linear, eps=eps)))
             null_inr_power[lambda_] += _interference_power_per_rx(h_ntn_tx, v_null)
 
     raw_inr_db = (
-        _safe_db(raw_inr_power[detected_mask] * float(tx_power) / float(noise_power), eps=eps)
+        _safe_db(raw_inr_power[detected_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
         if np.any(detected_mask)
         else np.empty((0,), dtype=np.float64)
     )
     null_inr_db = {
         lambda_: (
-            _safe_db(null_inr_power[lambda_][detected_mask] * float(tx_power) / float(noise_power), eps=eps)
+            _safe_db(
+                null_inr_power[lambda_][detected_mask] * float(tx_power) / float(inr_noise_power),
+                eps=eps,
+            )
             if np.any(detected_mask)
             else np.empty((0,), dtype=np.float64)
         )
@@ -272,7 +284,8 @@ def run_nulling_cdf_experiment(
     h_tn_th: float,
     tx_antennas: int,
     tx_power: float,
-    noise_power: float,
+    snr_noise_power: float,
+    inr_noise_power: float,
     music_kwargs: Dict[str, Any],
     sionna_phi_is_global: bool = True,
     theta_display_mode: str = "elevation",
@@ -329,7 +342,7 @@ def run_nulling_cdf_experiment(
             h_tn_th=float(h_tn_th),
             tx_antennas=int(tx_antennas),
             tx_power=float(tx_power),
-            noise_power=float(noise_power),
+            snr_noise_power=float(snr_noise_power),
             eps=eps,
         )
         min_count = int(pairing["min_count"])
@@ -390,7 +403,8 @@ def run_nulling_cdf_experiment(
                 round_idx=int(round_idx),
                 lambda_ranges=lambda_list,
                 tx_power=float(tx_power),
-                noise_power=float(noise_power),
+                snr_noise_power=float(snr_noise_power),
+                inr_noise_power=float(inr_noise_power),
                 eps=eps,
             )
 
