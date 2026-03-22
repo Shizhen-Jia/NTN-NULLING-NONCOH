@@ -114,8 +114,8 @@ class SceneConfigSionna:
         self.nsect = None              # Usually 3, for sector-based coverage
         # self.BS_height_above_roof = 35  # For base station on building
         # self.BS_height_above_ground = 45
-        self.BS_height_above_roof = 45  # For base station on building
-        self.BS_height_above_ground = 55
+        self.BS_height_above_roof = 75  # For base station on building
+        self.BS_height_above_ground = 85
         self.tn_height_above_roof = 1.2  # For base station on building
         self.tn_height_above_ground = 1.8
         self.ntn_height_above_roof = 1.2  # For base station on building
@@ -673,6 +673,9 @@ class SceneConfigSionna:
             for rx_name in list(self.scene.receivers):
                 self.scene.remove(rx_name)
 
+            if self.ntn_look_pos is None:
+                raise ValueError("ntn_look_pos is empty; run compute_positions before compute_paths.")
+
             self.scene.rx_array = PlanarArray(
                 num_rows=1,
                 num_cols=1,
@@ -689,8 +692,9 @@ class SceneConfigSionna:
                     position=self.rx_ntn_pos[i]
                 )
                 self.scene.add(rx)
-                rx.look_at([0,0,20000])
-                # rx.look_at(self.ntn_look_pos+self.rx_ntn_pos[i])
+                # All NTN users share the projected satellite look-at point
+                # for the current macro simulation.
+                rx.look_at(self.ntn_look_pos)
 
             
             self.paths_ntn = p_solver(scene=self.scene,

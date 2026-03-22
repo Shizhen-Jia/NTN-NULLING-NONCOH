@@ -292,6 +292,10 @@ def run_nulling_cdf_experiment(
     eps: float = 1e-12,
     plot_first_sim_only: bool = True,
     show_progress: bool = True,
+    resample_satellite_per_macro: bool = False,
+    satellite_azimuth_range_deg: Tuple[float, float] = (0.0, 360.0),
+    satellite_elevation_range_deg: Tuple[float, float] = (35.0, 90.0),
+    satellite_rng_seed: int | None = None,
 ) -> Dict[str, Any]:
     """Run n macro simulations and m min-count small rounds per macro simulation."""
     if int(num_macro_sims) <= 0:
@@ -309,6 +313,11 @@ def run_nulling_cdf_experiment(
     null_inr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
     macro_stats: List[Dict[str, Any]] = []
     bs_pos_ref: np.ndarray | None = None
+    sat_rng = (
+        np.random.default_rng(satellite_rng_seed)
+        if bool(resample_satellite_per_macro)
+        else None
+    )
 
     iterator = (
         trange(int(num_macro_sims), desc="Monte Carlo", leave=False)
@@ -323,8 +332,28 @@ def run_nulling_cdf_experiment(
                 if key in pos_kwargs:
                     pos_kwargs[key] = False
 
+        if sat_rng is not None:
+            sat_azimuth_deg = float(
+                sat_rng.uniform(
+                    float(satellite_azimuth_range_deg[0]),
+                    float(satellite_azimuth_range_deg[1]),
+                )
+            )
+            sat_elevation_deg = float(
+                sat_rng.uniform(
+                    float(satellite_elevation_range_deg[0]),
+                    float(satellite_elevation_range_deg[1]),
+                )
+            )
+            pos_kwargs["azimuth"] = sat_azimuth_deg
+            pos_kwargs["elevation"] = sat_elevation_deg
+        else:
+            sat_azimuth_deg = float(pos_kwargs["azimuth"])
+            sat_elevation_deg = float(pos_kwargs["elevation"])
+
         scene_config.compute_positions(**pos_kwargs)
         tx_pos = np.asarray(scene_config.tx_pos, dtype=np.float64)
+        sat_look_pos = np.asarray(scene_config.ntn_look_pos, dtype=np.float64).copy()
         if bs_pos_ref is None:
             bs_pos_ref = tx_pos.copy()
         elif tx_pos.shape != bs_pos_ref.shape or not np.allclose(tx_pos, bs_pos_ref):
@@ -386,6 +415,9 @@ def run_nulling_cdf_experiment(
                 "pair_counts_by_tx": pair_counts_by_tx.copy(),
                 "detected_ntn_count": int(detected_rx_union.size),
                 "interfered_ntn_count": interfered_ntn_count,
+                "satellite_azimuth_deg": float(sat_azimuth_deg),
+                "satellite_elevation_deg": float(sat_elevation_deg),
+                "satellite_look_pos": sat_look_pos.copy(),
                 "angle_metrics": music_quality["angle_metrics"],
                 "detected_subset_metrics": music_quality["detected_subset_metrics"],
                 "detected_pairs_summary": music_quality["detected_pairs_summary"],
@@ -462,6 +494,18 @@ def save_experiment_metrics(
         dtype=int,
     )
     if macro_stats:
+        save_dict["macro_stats_satellite_azimuth_deg"] = np.asarray(
+            [row.get("satellite_azimuth_deg", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_satellite_elevation_deg"] = np.asarray(
+            [row.get("satellite_elevation_deg", np.nan) for row in macro_stats],
+            dtype=np.float64,
+        )
+        save_dict["macro_stats_satellite_look_pos"] = np.stack(
+            [np.asarray(row.get("satellite_look_pos", [np.nan, np.nan, np.nan]), dtype=np.float64) for row in macro_stats],
+            axis=0,
+        )
         save_dict["macro_stats_pair_counts_by_tx"] = np.stack(
             [np.asarray(row["pair_counts_by_tx"], dtype=int) for row in macro_stats],
             axis=0,
