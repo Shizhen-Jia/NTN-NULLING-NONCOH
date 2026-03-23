@@ -10,7 +10,7 @@ __pycache__/
 *.npz
 *.log
 *.pkl
-
+ntn_music_detection_2.py
 # OS files
 .DS_Store
 Thumbs.db
@@ -22,3 +22,4 @@ blender_scene_big/
 result/
 NTN-Nulling/
 overleaf_ntn_spawc/
+musiccheck/

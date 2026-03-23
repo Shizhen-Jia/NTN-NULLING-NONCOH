@@ -2059,9 +2059,11 @@ def run_music_standard_pipeline(
                 h_hat_vec_mode = np.full((num_tx_ant,), np.nan + 1j * np.nan, dtype=np.complex128)
 
             if channel_mode == "conj":
+                u_hat_raw = np.conj(u_hat)
                 alpha_hat_raw = np.conj(alpha_hat_mode)
                 h_hat_vec_raw = np.conj(h_hat_vec_mode)
             else:
+                u_hat_raw = u_hat
                 alpha_hat_raw = alpha_hat_mode
                 h_hat_vec_raw = h_hat_vec_mode
 
@@ -2078,7 +2080,9 @@ def run_music_standard_pipeline(
             extras_mode[(int(rx_i), int(t))] = {
                 "rx_ant_idx": int(ant_idx),
                 "steering_idx": int(steer_idx),
+                "fit_score": float(fit_val),
                 "u_hat": np.asarray(u_hat, dtype=np.complex128),
+                "u_hat_raw": np.asarray(u_hat_raw, dtype=np.complex128),
                 "alpha_hat_mode": np.complex128(alpha_hat_mode),
                 "alpha_hat_raw": np.complex128(alpha_hat_raw),
                 "h_hat_vec_mode": np.asarray(h_hat_vec_mode, dtype=np.complex128),
@@ -2128,6 +2132,7 @@ def run_music_standard_pipeline(
 
                 rec: Dict[str, Any] = {
                     "score": float(score),
+                    "score_user": float(score),
                     "bs": int(t) // nsect_eff,
                     "sec": int(t) % nsect_eff,
                     "phi_hat_deg": float(phi_hat),
@@ -2142,16 +2147,24 @@ def run_music_standard_pipeline(
                 if extra is not None:
                     rec["rx_ant_idx"] = int(extra["rx_ant_idx"])
                     rec["steering_idx"] = int(extra["steering_idx"])
+                    rec["fit_score"] = float(extra.get("fit_score", np.nan))
                     rec["u_hat"] = np.asarray(extra["u_hat"], dtype=np.complex128)
+                    rec["u_hat_raw"] = np.asarray(extra["u_hat_raw"], dtype=np.complex128)
                     rec["alpha_hat_mode"] = np.complex128(extra["alpha_hat_mode"])
                     rec["alpha_hat_raw"] = np.complex128(extra["alpha_hat_raw"])
                     rec["h_hat_vec_mode"] = np.asarray(extra["h_hat_vec_mode"], dtype=np.complex128)
                     rec["h_hat_vec_raw"] = np.asarray(extra["h_hat_vec_raw"], dtype=np.complex128)
+                    fit_nonneg = float(np.nan_to_num(extra.get("fit_score", np.nan), nan=0.0, posinf=0.0, neginf=0.0))
+                    score_nonneg = float(np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0))
+                    rec["selection_score"] = score_nonneg * max(fit_nonneg, 0.0)
 
                     ant_idx_use = int(extra["rx_ant_idx"])
                     if ant_idx_use >= 0:
                         h_hat_all_mode[int(rx_i), ant_idx_use, int(t), :] = rec["h_hat_vec_mode"]
                         h_hat_all_raw[int(rx_i), ant_idx_use, int(t), :] = rec["h_hat_vec_raw"]
+                else:
+                    rec["fit_score"] = float("nan")
+                    rec["selection_score"] = float("nan")
                 pair_hat[key] = rec
 
     det_pairs = sorted(pair_hat.keys(), key=lambda k: (k[1], k[0]))
@@ -2163,6 +2176,18 @@ def run_music_standard_pipeline(
         pair_phi_hat_deg = np.array([pair_hat[k]["phi_hat_deg"] for k in det_pairs], dtype=float)
         pair_theta_hat_deg = np.array([pair_hat[k]["theta_hat_deg"] for k in det_pairs], dtype=float)
         pair_rx_ant_idx = np.array([int(pair_hat[k].get("rx_ant_idx", -1)) for k in det_pairs], dtype=int)
+        pair_score_user = np.array(
+            [float(pair_hat[k].get("score_user", pair_hat[k].get("score", np.nan))) for k in det_pairs],
+            dtype=float,
+        )
+        pair_fit_score = np.array(
+            [float(pair_hat[k].get("fit_score", np.nan)) for k in det_pairs],
+            dtype=float,
+        )
+        pair_selection_score = np.array(
+            [float(pair_hat[k].get("selection_score", np.nan)) for k in det_pairs],
+            dtype=float,
+        )
         pair_alpha_hat_mode = np.array(
             [np.complex128(pair_hat[k].get("alpha_hat_mode", np.nan + 1j * np.nan)) for k in det_pairs],
             dtype=np.complex128,
@@ -2175,6 +2200,12 @@ def run_music_standard_pipeline(
         pair_u_hat = np.vstack(
             [
                 np.asarray(pair_hat[k].get("u_hat", nan_vec), dtype=np.complex128).reshape(1, -1)
+                for k in det_pairs
+            ]
+        )
+        pair_u_hat_raw = np.vstack(
+            [
+                np.asarray(pair_hat[k].get("u_hat_raw", nan_vec), dtype=np.complex128).reshape(1, -1)
                 for k in det_pairs
             ]
         )
@@ -2198,9 +2229,13 @@ def run_music_standard_pipeline(
         pair_phi_hat_deg = np.empty((0,), dtype=float)
         pair_theta_hat_deg = np.empty((0,), dtype=float)
         pair_rx_ant_idx = np.empty((0,), dtype=int)
+        pair_score_user = np.empty((0,), dtype=float)
+        pair_fit_score = np.empty((0,), dtype=float)
+        pair_selection_score = np.empty((0,), dtype=float)
         pair_alpha_hat_mode = np.empty((0,), dtype=np.complex128)
         pair_alpha_hat_raw = np.empty((0,), dtype=np.complex128)
         pair_u_hat = np.empty((0, num_tx_ant), dtype=np.complex128)
+        pair_u_hat_raw = np.empty((0, num_tx_ant), dtype=np.complex128)
         pair_h_hat_vec_mode = np.empty((0, num_tx_ant), dtype=np.complex128)
         pair_h_hat_vec_raw = np.empty((0, num_tx_ant), dtype=np.complex128)
 
@@ -2218,7 +2253,11 @@ def run_music_standard_pipeline(
         "pair_phi_hat_deg": pair_phi_hat_deg,
         "pair_theta_hat_deg": pair_theta_hat_deg,
         "pair_rx_ant_idx": pair_rx_ant_idx,
+        "pair_score_user": pair_score_user,
+        "pair_fit_score": pair_fit_score,
+        "pair_selection_score": pair_selection_score,
         "pair_u_hat": pair_u_hat,
+        "pair_u_hat_raw": pair_u_hat_raw,
         "pair_alpha_hat_mode": pair_alpha_hat_mode,
         "pair_alpha_hat_raw": pair_alpha_hat_raw,
         "pair_h_hat_vec_mode": pair_h_hat_vec_mode,

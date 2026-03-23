@@ -695,7 +695,8 @@ class SceneConfigSionna:
                 self.scene.add(rx)
                 # All NTN users share the projected satellite look-at point
                 # for the current macro simulation.
-                rx.look_at(self.ntn_look_pos)
+                # rx.look_at(self.ntn_look_pos)
+                rx.look_at(self.ntn_look_pos+self.rx_ntn_pos[i])
 
             
             self.paths_ntn = p_solver(scene=self.scene,

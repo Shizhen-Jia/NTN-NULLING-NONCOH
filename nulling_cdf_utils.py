@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 
-from BeamformingCalc import nulling_bf_music_noncoh, svd_bf
+from BeamformingCalc import nulling_bf, svd_bf
 from ntn_music_detection import (
     build_ntn_truth_from_paths,
     collapse_cir_to_narrowband,
@@ -42,6 +42,62 @@ def _interference_power_per_rx(h_ntn_tx: np.ndarray, beam: np.ndarray) -> np.nda
         )
     eff = np.einsum("nra,ab->nr", h, v, optimize=True)
     return np.sum(np.abs(eff) ** 2, axis=1).real.astype(np.float64)
+
+
+def _covariance_from_channel_vectors(
+    h_hat_vectors: np.ndarray,
+    *,
+    num_tx_ant: int,
+) -> np.ndarray:
+    """Build sum_k h_hat_k h_hat_k^H from reconstructed channel vectors."""
+    h_hat = np.asarray(h_hat_vectors, dtype=np.complex128)
+    if h_hat.size == 0:
+        return np.zeros((num_tx_ant, num_tx_ant), dtype=np.complex128)
+    if h_hat.ndim == 1:
+        h_hat = h_hat.reshape(1, -1)
+    if h_hat.ndim != 2 or h_hat.shape[1] != num_tx_ant:
+        raise ValueError(
+            f"h_hat_vectors must have shape (K, {num_tx_ant}); got {h_hat.shape}."
+        )
+    return np.einsum("ka,kb->ab", h_hat, np.conjugate(h_hat), optimize=True)
+
+
+def _resolve_b_term_limit(max_detected_b_terms: str | int | None) -> int | None:
+    """Normalize the user-facing B-term limit.
+
+    Returns
+    -------
+    int | None
+        `None` means keep all detected terms. A positive integer means keep at
+        most that many detected terms for each TX.
+    """
+    if max_detected_b_terms is None:
+        return None
+
+    if isinstance(max_detected_b_terms, str):
+        value = max_detected_b_terms.strip().lower()
+        if value == "all":
+            return None
+        if value.isdigit():
+            max_detected_b_terms = int(value)
+        else:
+            raise ValueError(
+                "max_detected_b_terms must be 'all', None, or a positive integer; "
+                f"got {max_detected_b_terms!r}."
+            )
+
+    if isinstance(max_detected_b_terms, (int, np.integer)):
+        limit = int(max_detected_b_terms)
+        if limit <= 0:
+            raise ValueError(
+                f"max_detected_b_terms must be positive when numeric; got {limit}."
+            )
+        return limit
+
+    raise ValueError(
+        "max_detected_b_terms must be 'all', None, or a positive integer; "
+        f"got type {type(max_detected_b_terms).__name__}."
+    )
 
 
 def pair_tn_to_strongest_tx(
@@ -126,11 +182,25 @@ def build_music_tx_lookup(
     num_tx_total: int,
     num_tx_ant: int,
 ) -> Dict[int, Dict[str, np.ndarray]]:
-    """Collect detected NTN steering vectors and weights per TX."""
+    """Collect detected NTN reconstructions per TX.
+
+    The returned `h_hat` uses the raw-channel convention and is reconstructed as
+    `h_hat = alpha_hat_raw * u_hat_raw`, matching the old covariance-based nulling
+    path that expects channel vectors rather than only steering directions.
+    """
     pair_rx = np.asarray(ntn_music_out.get("pair_rx_idx", []), dtype=int)
     pair_t = np.asarray(ntn_music_out.get("pair_t_idx", []), dtype=int)
     pair_u = np.asarray(ntn_music_out.get("pair_u_hat", []), dtype=np.complex128)
+    pair_u_raw = np.asarray(
+        ntn_music_out.get("pair_u_hat_raw", ntn_music_out.get("pair_u_hat", [])),
+        dtype=np.complex128,
+    )
     pair_alpha_hat = np.asarray(ntn_music_out.get("pair_alpha_hat_raw", []), dtype=np.complex128)
+    pair_h_hat_raw = np.asarray(ntn_music_out.get("pair_h_hat_vec_raw", []), dtype=np.complex128)
+    pair_rx_ant_idx = np.asarray(ntn_music_out.get("pair_rx_ant_idx", []), dtype=int)
+    pair_score_user = np.asarray(ntn_music_out.get("pair_score_user", []), dtype=float)
+    pair_fit_score = np.asarray(ntn_music_out.get("pair_fit_score", []), dtype=float)
+    pair_selection_score = np.asarray(ntn_music_out.get("pair_selection_score", []), dtype=float)
 
     if pair_u.ndim == 1:
         if pair_u.size == 0:
@@ -145,8 +215,53 @@ def build_music_tx_lookup(
         raise ValueError(
             f"pair_u_hat antenna dimension mismatch: expected {num_tx_ant}, got {pair_u.shape[1]}."
         )
-    if not (pair_rx.size == pair_t.size == pair_alpha_hat.size == pair_u.shape[0]):
+
+    if pair_u_raw.ndim == 1:
+        if pair_u_raw.size == 0:
+            pair_u_raw = np.empty((0, num_tx_ant), dtype=np.complex128)
+        elif pair_u_raw.size == num_tx_ant:
+            pair_u_raw = pair_u_raw.reshape(1, -1)
+        else:
+            raise ValueError(f"Unexpected pair_u_hat_raw shape: {pair_u_raw.shape}")
+    if pair_u_raw.ndim != 2:
+        raise ValueError(f"pair_u_hat_raw must be 2D after reshape, got {pair_u_raw.shape}")
+    if pair_u_raw.shape[1] != num_tx_ant and pair_u_raw.shape[0] > 0:
+        raise ValueError(
+            f"pair_u_hat_raw antenna dimension mismatch: expected {num_tx_ant}, got {pair_u_raw.shape[1]}."
+        )
+
+    if pair_h_hat_raw.ndim == 1:
+        if pair_h_hat_raw.size == 0:
+            pair_h_hat_raw = np.empty((0, num_tx_ant), dtype=np.complex128)
+        elif pair_h_hat_raw.size == num_tx_ant:
+            pair_h_hat_raw = pair_h_hat_raw.reshape(1, -1)
+        else:
+            raise ValueError(f"Unexpected pair_h_hat_vec_raw shape: {pair_h_hat_raw.shape}")
+    if pair_h_hat_raw.ndim != 2:
+        raise ValueError(f"pair_h_hat_vec_raw must be 2D after reshape, got {pair_h_hat_raw.shape}")
+    if pair_h_hat_raw.shape[1] != num_tx_ant and pair_h_hat_raw.shape[0] > 0:
+        raise ValueError(
+            "pair_h_hat_vec_raw antenna dimension mismatch: "
+            f"expected {num_tx_ant}, got {pair_h_hat_raw.shape[1]}."
+        )
+
+    if not (
+        pair_rx.size
+        == pair_t.size
+        == pair_rx_ant_idx.size
+        == pair_alpha_hat.size
+        == pair_u.shape[0]
+        == pair_u_raw.shape[0]
+    ):
         raise ValueError("Inconsistent MUSIC pair lengths in ntn_music_out.")
+    if pair_h_hat_raw.shape[0] not in (0, pair_rx.size):
+        raise ValueError("pair_h_hat_vec_raw length does not match MUSIC pair count.")
+    if pair_score_user.size not in (0, pair_rx.size):
+        raise ValueError("pair_score_user length does not match MUSIC pair count.")
+    if pair_fit_score.size not in (0, pair_rx.size):
+        raise ValueError("pair_fit_score length does not match MUSIC pair count.")
+    if pair_selection_score.size not in (0, pair_rx.size):
+        raise ValueError("pair_selection_score length does not match MUSIC pair count.")
 
     lookup: Dict[int, Dict[str, np.ndarray]] = {}
     for tx_idx in range(num_tx_total):
@@ -154,8 +269,9 @@ def build_music_tx_lookup(
         if not np.any(tx_mask):
             lookup[int(tx_idx)] = {
                 "rx_detected": np.empty((0,), dtype=int),
-                "u": np.empty((0, num_tx_ant), dtype=np.complex128),
-                "g": np.empty((0,), dtype=np.float64),
+                "pair_rx": np.empty((0,), dtype=int),
+                "pair_rx_ant": np.empty((0,), dtype=int),
+                "h_hat": np.empty((0, num_tx_ant), dtype=np.complex128),
             }
             continue
 
@@ -163,26 +279,224 @@ def build_music_tx_lookup(
         rx_t = rx_t[(rx_t >= 0) & (rx_t < num_ntn_rx)]
         rx_detected = np.unique(rx_t)
 
+        pair_rx_t = np.asarray(pair_rx[tx_mask], dtype=int)
+        pair_rx_ant_t = np.asarray(pair_rx_ant_idx[tx_mask], dtype=int)
+        score_user_t = (
+            np.asarray(pair_score_user[tx_mask], dtype=float)
+            if pair_score_user.size > 0
+            else np.full((int(np.count_nonzero(tx_mask)),), np.nan, dtype=float)
+        )
+        fit_score_t = (
+            np.asarray(pair_fit_score[tx_mask], dtype=float)
+            if pair_fit_score.size > 0
+            else np.full((int(np.count_nonzero(tx_mask)),), np.nan, dtype=float)
+        )
+        selection_score_t = (
+            np.asarray(pair_selection_score[tx_mask], dtype=float)
+            if pair_selection_score.size > 0
+            else np.full((int(np.count_nonzero(tx_mask)),), np.nan, dtype=float)
+        )
         u_t = np.asarray(pair_u[tx_mask], dtype=np.complex128)
+        u_raw_t = np.asarray(pair_u_raw[tx_mask], dtype=np.complex128)
         alpha_t = np.asarray(pair_alpha_hat[tx_mask], dtype=np.complex128)
+        h_hat_raw_t = (
+            np.asarray(pair_h_hat_raw[tx_mask], dtype=np.complex128)
+            if pair_h_hat_raw.shape[0] > 0
+            else np.empty((0, num_tx_ant), dtype=np.complex128)
+        )
+
         finite_u = np.all(np.isfinite(np.real(u_t)) & np.isfinite(np.imag(u_t)), axis=1)
+        finite_u_raw = np.all(np.isfinite(np.real(u_raw_t)) & np.isfinite(np.imag(u_raw_t)), axis=1)
         finite_a = np.isfinite(np.real(alpha_t)) & np.isfinite(np.imag(alpha_t))
-        keep = finite_u & finite_a
+        keep = finite_u & finite_u_raw & finite_a
 
         if np.any(keep):
-            u_keep = u_t[keep]
-            g_keep = np.abs(alpha_t[keep]) ** 2
+            pair_rx_keep = pair_rx_t[keep]
+            pair_rx_ant_keep = pair_rx_ant_t[keep]
+            score_user_keep = score_user_t[keep]
+            fit_score_keep = fit_score_t[keep]
+            selection_score_keep = selection_score_t[keep]
+            u_raw_keep = u_raw_t[keep]
+            alpha_keep = alpha_t[keep]
+            h_hat_keep = alpha_keep[:, None] * u_raw_keep
+
+            if h_hat_raw_t.shape[0] > 0:
+                h_hat_raw_keep = h_hat_raw_t[keep]
+                finite_h_hat_raw = np.all(
+                    np.isfinite(np.real(h_hat_raw_keep)) & np.isfinite(np.imag(h_hat_raw_keep)),
+                    axis=1,
+                )
+                if np.any(finite_h_hat_raw):
+                    h_hat_keep[finite_h_hat_raw] = h_hat_raw_keep[finite_h_hat_raw]
+            if not np.any(np.isfinite(selection_score_keep)):
+                fit_nonneg = np.maximum(
+                    np.nan_to_num(fit_score_keep, nan=0.0, posinf=0.0, neginf=0.0),
+                    0.0,
+                )
+                score_nonneg = np.maximum(
+                    np.nan_to_num(score_user_keep, nan=0.0, posinf=0.0, neginf=0.0),
+                    0.0,
+                )
+                selection_score_keep = score_nonneg * fit_nonneg
         else:
-            u_keep = np.empty((0, num_tx_ant), dtype=np.complex128)
-            g_keep = np.empty((0,), dtype=np.float64)
+            pair_rx_keep = np.empty((0,), dtype=int)
+            pair_rx_ant_keep = np.empty((0,), dtype=int)
+            score_user_keep = np.empty((0,), dtype=float)
+            fit_score_keep = np.empty((0,), dtype=float)
+            selection_score_keep = np.empty((0,), dtype=float)
+            h_hat_keep = np.empty((0, num_tx_ant), dtype=np.complex128)
 
         lookup[int(tx_idx)] = {
             "rx_detected": rx_detected.astype(int),
-            "u": np.asarray(u_keep, dtype=np.complex128),
-            "g": np.asarray(g_keep, dtype=np.float64),
+            "pair_rx": np.asarray(pair_rx_keep, dtype=int),
+            "pair_rx_ant": np.asarray(pair_rx_ant_keep, dtype=int),
+            "score_user": np.asarray(score_user_keep, dtype=float),
+            "fit_score": np.asarray(fit_score_keep, dtype=float),
+            "selection_score": np.asarray(selection_score_keep, dtype=float),
+            "h_hat": np.asarray(h_hat_keep, dtype=np.complex128),
         }
 
     return lookup
+
+
+def _extract_tx_b_inputs(
+    h_ntn_tx: np.ndarray,
+    lookup: Dict[str, np.ndarray],
+    *,
+    num_tx_ant: int,
+    max_detected_b_terms: str | int | None = "all",
+) -> Dict[str, np.ndarray]:
+    """Collect the per-TX channel vectors that are actually used to form B."""
+    h_ntn_t = np.asarray(h_ntn_tx, dtype=np.complex128)
+    if h_ntn_t.ndim != 3:
+        raise ValueError("h_ntn_tx must have shape (num_ntn_rx, num_ntn_rx_ant, num_tx_ant).")
+    if h_ntn_t.shape[2] != int(num_tx_ant):
+        raise ValueError(
+            f"h_ntn_tx antenna dimension mismatch: expected {num_tx_ant}, got {h_ntn_t.shape[2]}."
+        )
+
+    pair_rx_t = np.asarray(lookup.get("pair_rx", np.empty((0,), dtype=int)), dtype=int)
+    pair_rx_ant_t = np.asarray(lookup.get("pair_rx_ant", np.empty((0,), dtype=int)), dtype=int)
+    selection_score_t = np.asarray(
+        lookup.get("selection_score", np.empty((0,), dtype=float)),
+        dtype=float,
+    )
+    h_hat_t = np.asarray(
+        lookup.get("h_hat", np.empty((0, num_tx_ant), dtype=np.complex128)),
+        dtype=np.complex128,
+    )
+
+    if h_hat_t.ndim == 1:
+        if h_hat_t.size == 0:
+            h_hat_t = np.empty((0, num_tx_ant), dtype=np.complex128)
+        elif h_hat_t.size == num_tx_ant:
+            h_hat_t = h_hat_t.reshape(1, -1)
+        else:
+            raise ValueError(f"Unexpected h_hat shape for one TX: {h_hat_t.shape}")
+    if h_hat_t.ndim != 2 or h_hat_t.shape[1] != num_tx_ant:
+        raise ValueError(
+            f"h_hat must have shape (K, {num_tx_ant}) for one TX; got {h_hat_t.shape}."
+        )
+    if not (pair_rx_t.size == pair_rx_ant_t.size == h_hat_t.shape[0]):
+        raise ValueError(
+            "Inconsistent per-TX MUSIC lookup lengths: "
+            f"pair_rx={pair_rx_t.size}, pair_rx_ant={pair_rx_ant_t.size}, h_hat={h_hat_t.shape[0]}."
+        )
+    if selection_score_t.size not in (0, h_hat_t.shape[0]):
+        raise ValueError(
+            "Inconsistent per-TX selection score length: "
+            f"selection_score={selection_score_t.size}, h_hat={h_hat_t.shape[0]}."
+        )
+    if selection_score_t.size == 0 and h_hat_t.shape[0] > 0:
+        selection_score_t = np.full((h_hat_t.shape[0],), np.nan, dtype=float)
+
+    max_terms = _resolve_b_term_limit(max_detected_b_terms)
+    if max_terms is not None and h_hat_t.shape[0] > max_terms:
+        # Keep the most reliable detected users for this TX. The primary ranking
+        # uses a combined MUSIC reliability score = detection score * steering-fit
+        # score. If that score is unavailable, fall back to reconstructed channel
+        # energy. The same selected indices are used for both true-h and h_hat
+        # branches so the comparison stays apples-to-apples.
+        rank_score = np.asarray(selection_score_t, dtype=float)
+        if not np.any(np.isfinite(rank_score)):
+            rank_score = np.sum(np.abs(h_hat_t) ** 2, axis=1).real
+        else:
+            invalid = ~np.isfinite(rank_score)
+            if np.any(invalid):
+                fallback_power = np.sum(np.abs(h_hat_t[invalid]) ** 2, axis=1).real
+                rank_score = rank_score.copy()
+                rank_score[invalid] = fallback_power
+        keep_idx = np.argsort(-rank_score, kind="mergesort")[:max_terms]
+        keep_idx = np.sort(keep_idx)
+        pair_rx_t = pair_rx_t[keep_idx]
+        pair_rx_ant_t = pair_rx_ant_t[keep_idx]
+        selection_score_t = selection_score_t[keep_idx]
+        h_hat_t = h_hat_t[keep_idx]
+
+    valid_true_pairs = (
+        (pair_rx_t >= 0)
+        & (pair_rx_t < h_ntn_t.shape[0])
+        & (pair_rx_ant_t >= 0)
+        & (pair_rx_ant_t < h_ntn_t.shape[1])
+    )
+    if np.any(valid_true_pairs):
+        h_true_t = np.asarray(
+            h_ntn_t[pair_rx_t[valid_true_pairs], pair_rx_ant_t[valid_true_pairs], :],
+            dtype=np.complex128,
+        )
+    else:
+        h_true_t = np.empty((0, num_tx_ant), dtype=np.complex128)
+
+    return {
+        "pair_rx": pair_rx_t,
+        "pair_rx_ant": pair_rx_ant_t,
+        "selection_score": selection_score_t,
+        "valid_true_pairs": valid_true_pairs,
+        "selected_rx": np.unique(pair_rx_t).astype(int) if pair_rx_t.size > 0 else np.empty((0,), dtype=int),
+        "h_true": h_true_t,
+        "h_hat": h_hat_t,
+    }
+
+
+def summarize_b_usage_by_tx(
+    h_ntn_all: np.ndarray,
+    *,
+    music_lookup: Dict[int, Dict[str, np.ndarray]],
+    max_detected_b_terms: str | int | None = "all",
+) -> Dict[str, np.ndarray]:
+    """Summarize how many NTN channels each TX actually uses to build B."""
+    h_ntn = np.asarray(h_ntn_all, dtype=np.complex128)
+    if h_ntn.ndim != 4:
+        raise ValueError("h_ntn_all must have shape (num_ntn_rx, num_ntn_rx_ant, num_tx, num_tx_ant).")
+
+    num_tx_total = int(h_ntn.shape[2])
+    num_tx_ant = int(h_ntn.shape[3])
+    b_true_ntn_count_by_tx = np.zeros((num_tx_total,), dtype=int)
+    b_true_term_count_by_tx = np.zeros((num_tx_total,), dtype=int)
+    b_hat_ntn_count_by_tx = np.zeros((num_tx_total,), dtype=int)
+    b_hat_term_count_by_tx = np.zeros((num_tx_total,), dtype=int)
+
+    for tx_idx in range(num_tx_total):
+        tx_inputs = _extract_tx_b_inputs(
+            h_ntn[:, :, tx_idx, :],
+            music_lookup.get(int(tx_idx), {}),
+            num_tx_ant=num_tx_ant,
+            max_detected_b_terms=max_detected_b_terms,
+        )
+        true_pair_rx = np.asarray(tx_inputs["pair_rx"][tx_inputs["valid_true_pairs"]], dtype=int)
+        hat_pair_rx = np.asarray(tx_inputs["pair_rx"], dtype=int)
+
+        b_true_term_count_by_tx[tx_idx] = int(true_pair_rx.size)
+        b_hat_term_count_by_tx[tx_idx] = int(tx_inputs["h_hat"].shape[0])
+        b_true_ntn_count_by_tx[tx_idx] = int(np.unique(true_pair_rx).size) if true_pair_rx.size > 0 else 0
+        b_hat_ntn_count_by_tx[tx_idx] = int(np.unique(hat_pair_rx).size) if hat_pair_rx.size > 0 else 0
+
+    return {
+        "b_true_ntn_count_by_tx": b_true_ntn_count_by_tx,
+        "b_true_term_count_by_tx": b_true_term_count_by_tx,
+        "b_hat_ntn_count_by_tx": b_hat_ntn_count_by_tx,
+        "b_hat_term_count_by_tx": b_hat_term_count_by_tx,
+    }
 
 
 def run_small_round(
@@ -195,6 +509,7 @@ def run_small_round(
     tx_power: float,
     snr_noise_power: float,
     inr_noise_power: float,
+    max_detected_b_terms: str | int | None = "all",
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """Run one small simulation round where every TX serves one paired TN."""
@@ -207,10 +522,12 @@ def run_small_round(
     lambda_list = [float(v) for v in lambda_ranges]
 
     raw_snr_db: List[float] = []
-    null_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    perfect_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    est_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
     raw_inr_power = np.zeros((num_ntn_rx,), dtype=np.float64)
-    null_inr_power = {lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list}
-    detected_mask = np.zeros((num_ntn_rx,), dtype=bool)
+    perfect_inr_power = {lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list}
+    est_inr_power = {lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list}
+    eval_mask = np.zeros((num_ntn_rx,), dtype=bool)
 
     for tx_idx in range(num_tx_total):
         tx_pairs = pairs_by_tx.get(int(tx_idx), [])
@@ -230,35 +547,70 @@ def run_small_round(
         raw_inr_power += _interference_power_per_rx(h_ntn_tx, w_t)
 
         lookup = music_lookup.get(int(tx_idx), {})
-        rx_detected = np.asarray(lookup.get("rx_detected", np.empty((0,), dtype=int)), dtype=int)
-        if rx_detected.size > 0:
-            detected_mask[rx_detected] = True
 
-        u_t = np.asarray(lookup.get("u", np.empty((0, h_tn.shape[0]), dtype=np.complex128)), dtype=np.complex128)
-        g_t = np.asarray(lookup.get("g", np.empty((0,), dtype=np.float64)), dtype=np.float64)
+        tx_inputs = _extract_tx_b_inputs(
+            h_ntn_tx,
+            lookup,
+            num_tx_ant=h_tn.shape[0],
+            max_detected_b_terms=max_detected_b_terms,
+        )
+        selected_rx_t = np.asarray(tx_inputs["selected_rx"], dtype=int)
+        if selected_rx_t.size > 0:
+            eval_mask[selected_rx_t] = True
+        h_true_t = np.asarray(tx_inputs["h_true"], dtype=np.complex128)
+        h_hat_t = np.asarray(tx_inputs["h_hat"], dtype=np.complex128)
+
+        interference_term_true = _covariance_from_channel_vectors(
+            h_true_t,
+            num_tx_ant=h_tn.shape[0],
+        )
+        interference_term_hat = _covariance_from_channel_vectors(
+            h_hat_t,
+            num_tx_ant=h_tn.shape[0],
+        )
 
         for lambda_ in lambda_list:
-            v_null, _, _, _ = nulling_bf_music_noncoh(h_tn, w_r, u_t, g_t, lambda_, eps=eps)
-            null_snr_linear = (
-                np.abs((v_null.conj().T @ h_tn @ w_r).item()) ** 2
+            v_null_true, _, _, _ = nulling_bf(h_tn, w_r, interference_term_true, lambda_)
+            v_null_hat, _, _, _ = nulling_bf(h_tn, w_r, interference_term_hat, lambda_)
+
+            perfect_snr_linear = (
+                np.abs((v_null_true.conj().T @ h_tn @ w_r).item()) ** 2
                 * float(tx_power)
                 / float(snr_noise_power)
             )
-            null_snr_db[lambda_].append(float(_safe_db(null_snr_linear, eps=eps)))
-            null_inr_power[lambda_] += _interference_power_per_rx(h_ntn_tx, v_null)
+            est_snr_linear = (
+                np.abs((v_null_hat.conj().T @ h_tn @ w_r).item()) ** 2
+                * float(tx_power)
+                / float(snr_noise_power)
+            )
+            perfect_snr_db[lambda_].append(float(_safe_db(perfect_snr_linear, eps=eps)))
+            est_snr_db[lambda_].append(float(_safe_db(est_snr_linear, eps=eps)))
+            perfect_inr_power[lambda_] += _interference_power_per_rx(h_ntn_tx, v_null_true)
+            est_inr_power[lambda_] += _interference_power_per_rx(h_ntn_tx, v_null_hat)
 
     raw_inr_db = (
-        _safe_db(raw_inr_power[detected_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
-        if np.any(detected_mask)
+        _safe_db(raw_inr_power[eval_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
+        if np.any(eval_mask)
         else np.empty((0,), dtype=np.float64)
     )
-    null_inr_db = {
+    perfect_inr_db = {
         lambda_: (
             _safe_db(
-                null_inr_power[lambda_][detected_mask] * float(tx_power) / float(inr_noise_power),
+                perfect_inr_power[lambda_][eval_mask] * float(tx_power) / float(inr_noise_power),
                 eps=eps,
             )
-            if np.any(detected_mask)
+            if np.any(eval_mask)
+            else np.empty((0,), dtype=np.float64)
+        )
+        for lambda_ in lambda_list
+    }
+    est_inr_db = {
+        lambda_: (
+            _safe_db(
+                est_inr_power[lambda_][eval_mask] * float(tx_power) / float(inr_noise_power),
+                eps=eps,
+            )
+            if np.any(eval_mask)
             else np.empty((0,), dtype=np.float64)
         )
         for lambda_ in lambda_list
@@ -266,11 +618,15 @@ def run_small_round(
 
     return {
         "raw_snr_db": np.asarray(raw_snr_db, dtype=np.float64),
-        "null_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in null_snr_db.items()},
+        "perfect_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in perfect_snr_db.items()},
+        "est_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_db.items()},
+        "null_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_db.items()},
         "raw_inr_db": np.asarray(raw_inr_db, dtype=np.float64),
-        "null_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in null_inr_db.items()},
-        "detected_mask": detected_mask,
-        "detected_count": int(np.count_nonzero(detected_mask)),
+        "perfect_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in perfect_inr_db.items()},
+        "est_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_inr_db.items()},
+        "null_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_inr_db.items()},
+        "detected_mask": eval_mask,
+        "detected_count": int(np.count_nonzero(eval_mask)),
     }
 
 
@@ -296,10 +652,12 @@ def run_nulling_cdf_experiment(
     satellite_azimuth_range_deg: Tuple[float, float] = (0.0, 360.0),
     satellite_elevation_range_deg: Tuple[float, float] = (35.0, 90.0),
     satellite_rng_seed: int | None = None,
+    max_detected_b_terms: str | int | None = "all",
 ) -> Dict[str, Any]:
     """Run n macro simulations and m min-count small rounds per macro simulation."""
     if int(num_macro_sims) <= 0:
         raise ValueError("num_macro_sims must be positive.")
+    resolved_b_term_limit = _resolve_b_term_limit(max_detected_b_terms)
 
     try:
         from tqdm.auto import trange
@@ -309,8 +667,10 @@ def run_nulling_cdf_experiment(
     lambda_list = [float(v) for v in lambda_ranges]
     raw_snr_all: List[float] = []
     raw_inr_all: List[float] = []
-    null_snr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
-    null_inr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    perfect_snr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    est_snr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    perfect_inr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    est_inr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
     macro_stats: List[Dict[str, Any]] = []
     bs_pos_ref: np.ndarray | None = None
     sat_rng = (
@@ -403,6 +763,11 @@ def run_nulling_cdf_experiment(
             num_tx_total=num_tx_total,
             num_tx_ant=num_tx_ant,
         )
+        b_usage_by_tx = summarize_b_usage_by_tx(
+            h_ntn_all,
+            music_lookup=music_lookup,
+            max_detected_b_terms=resolved_b_term_limit,
+        )
 
         detected_rx_union = np.asarray(ntn_music_out.get("detected_rx_indices_unique", []), dtype=int)
         interfered_ntn_count = int(np.count_nonzero(np.any(np.abs(h_ntn_all) > eps, axis=(1, 2, 3))))
@@ -415,6 +780,22 @@ def run_nulling_cdf_experiment(
                 "pair_counts_by_tx": pair_counts_by_tx.copy(),
                 "detected_ntn_count": int(detected_rx_union.size),
                 "interfered_ntn_count": interfered_ntn_count,
+                "b_true_ntn_count_by_tx": np.asarray(
+                    b_usage_by_tx["b_true_ntn_count_by_tx"],
+                    dtype=int,
+                ),
+                "b_true_term_count_by_tx": np.asarray(
+                    b_usage_by_tx["b_true_term_count_by_tx"],
+                    dtype=int,
+                ),
+                "b_hat_ntn_count_by_tx": np.asarray(
+                    b_usage_by_tx["b_hat_ntn_count_by_tx"],
+                    dtype=int,
+                ),
+                "b_hat_term_count_by_tx": np.asarray(
+                    b_usage_by_tx["b_hat_term_count_by_tx"],
+                    dtype=int,
+                ),
                 "satellite_azimuth_deg": float(sat_azimuth_deg),
                 "satellite_elevation_deg": float(sat_elevation_deg),
                 "satellite_look_pos": sat_look_pos.copy(),
@@ -437,27 +818,39 @@ def run_nulling_cdf_experiment(
                 tx_power=float(tx_power),
                 snr_noise_power=float(snr_noise_power),
                 inr_noise_power=float(inr_noise_power),
+                max_detected_b_terms=resolved_b_term_limit,
                 eps=eps,
             )
 
             raw_snr_all.extend(np.asarray(round_out["raw_snr_db"], dtype=np.float64).tolist())
             raw_inr_all.extend(np.asarray(round_out["raw_inr_db"], dtype=np.float64).tolist())
             for lambda_ in lambda_list:
-                null_snr_all[lambda_].extend(
-                    np.asarray(round_out["null_snr_db"][lambda_], dtype=np.float64).tolist()
+                perfect_snr_all[lambda_].extend(
+                    np.asarray(round_out["perfect_snr_db"][lambda_], dtype=np.float64).tolist()
                 )
-                null_inr_all[lambda_].extend(
-                    np.asarray(round_out["null_inr_db"][lambda_], dtype=np.float64).tolist()
+                est_snr_all[lambda_].extend(
+                    np.asarray(round_out["est_snr_db"][lambda_], dtype=np.float64).tolist()
+                )
+                perfect_inr_all[lambda_].extend(
+                    np.asarray(round_out["perfect_inr_db"][lambda_], dtype=np.float64).tolist()
+                )
+                est_inr_all[lambda_].extend(
+                    np.asarray(round_out["est_inr_db"][lambda_], dtype=np.float64).tolist()
                 )
 
     return {
         "raw_snr_db": np.asarray(raw_snr_all, dtype=np.float64),
         "raw_inr_db": np.asarray(raw_inr_all, dtype=np.float64),
-        "null_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in null_snr_all.items()},
-        "null_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in null_inr_all.items()},
+        "perfect_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in perfect_snr_all.items()},
+        "est_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_all.items()},
+        "null_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_all.items()},
+        "perfect_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in perfect_inr_all.items()},
+        "est_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_inr_all.items()},
+        "null_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_inr_all.items()},
         "macro_stats": macro_stats,
         "bs_pos_ref": bs_pos_ref,
         "lambda_ranges": np.asarray(lambda_list, dtype=np.float64),
+        "max_detected_b_terms": "all" if resolved_b_term_limit is None else int(resolved_b_term_limit),
     }
 
 
@@ -476,9 +869,20 @@ def save_experiment_metrics(
         "raw_snr_db": np.asarray(experiment_out["raw_snr_db"], dtype=np.float64),
         "raw_inr_db": np.asarray(experiment_out["raw_inr_db"], dtype=np.float64),
         "lambda_ranges": np.asarray(experiment_out["lambda_ranges"], dtype=np.float64),
+        "max_detected_b_terms": np.asarray([str(experiment_out.get("max_detected_b_terms", "all"))]),
     }
+    if experiment_out.get("bs_pos_ref") is not None:
+        save_dict["bs_pos_ref"] = np.asarray(experiment_out["bs_pos_ref"], dtype=np.float64)
+    for lambda_, vals in experiment_out["perfect_snr_db"].items():
+        save_dict[f"perfect_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out["est_snr_db"].items():
+        save_dict[f"est_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out["null_snr_db"].items():
         save_dict[f"null_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out["perfect_inr_db"].items():
+        save_dict[f"perfect_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out["est_inr_db"].items():
+        save_dict[f"est_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out["null_inr_db"].items():
         save_dict[f"null_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
 
@@ -508,6 +912,22 @@ def save_experiment_metrics(
         )
         save_dict["macro_stats_pair_counts_by_tx"] = np.stack(
             [np.asarray(row["pair_counts_by_tx"], dtype=int) for row in macro_stats],
+            axis=0,
+        )
+        save_dict["macro_stats_b_true_ntn_count_by_tx"] = np.stack(
+            [np.asarray(row.get("b_true_ntn_count_by_tx", []), dtype=int) for row in macro_stats],
+            axis=0,
+        )
+        save_dict["macro_stats_b_true_term_count_by_tx"] = np.stack(
+            [np.asarray(row.get("b_true_term_count_by_tx", []), dtype=int) for row in macro_stats],
+            axis=0,
+        )
+        save_dict["macro_stats_b_hat_ntn_count_by_tx"] = np.stack(
+            [np.asarray(row.get("b_hat_ntn_count_by_tx", []), dtype=int) for row in macro_stats],
+            axis=0,
+        )
+        save_dict["macro_stats_b_hat_term_count_by_tx"] = np.stack(
+            [np.asarray(row.get("b_hat_term_count_by_tx", []), dtype=int) for row in macro_stats],
             axis=0,
         )
         save_dict["macro_stats_phi_mae_deg"] = np.asarray(
