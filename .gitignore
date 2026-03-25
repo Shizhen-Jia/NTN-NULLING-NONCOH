@@ -11,6 +11,7 @@ __pycache__/
 *.log
 *.pkl
 ntn_music_detection_2.py
+nulling_cdf_utils_2.py
 # OS files
 .DS_Store
 Thumbs.db

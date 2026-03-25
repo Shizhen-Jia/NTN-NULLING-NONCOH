@@ -25,11 +25,11 @@ def satellite_projection(azimuth, elevation, distance, L, W):
     z = distance * np.sin(elevation_rad)
     
     # If z > 100, project to z=100
-    if z > 100:
-        alpha = 100.0 / z
+    if z > 10000:
+        alpha = 10000.0 / z
         x *= alpha
         y *= alpha
-        z = 100.0
+        z = 10000.0
 
     # Clamp x, y
     x_min, x_max = -W / 2.0, W / 2.0
