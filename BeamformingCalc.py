@@ -60,24 +60,20 @@ def nulling_bf(h: np.ndarray,
     """
     
     # h= ((h)*np.sqrt(tx_antennas)  /np.linalg.norm(h))
-    # h = ((h) /np.linalg.norm(h))
     # interference_term = (interference_term) /np.linalg.norm(interference_term)
     # Build the matrix Q
+    # h = (h) /np.linalg.norm(h)
     A = h @ w_r @ w_r.conj().T @ h.conj().T
     B = lambda_ * interference_term
-    Q = A-B
-    # Q = h @ w_r @ w_r.conj().T @ h.conj().T - lambda_ * interference_term
-    
-    # Eigen-decomposition of Q
-    eigen_values, v_nulls = np.linalg.eig(Q)
+    Q = A - B
+    # Q should be Hermitian in theory. Enforce symmetry before eigendecomposition
+    # so the "largest" eigenvector is chosen consistently from real eigenvalues.
+    Q = 0.5 * (Q + Q.conj().T)
 
-    # Sort eigenvalues from largest to smallest
-    idx = np.argsort(eigen_values)[::-1]
-    eigen_values_sorted = eigen_values[idx]
-    max_eigen_value = eigen_values_sorted[0]
-    v_nulls = v_nulls[:, idx]
-    # The nulling vector is the eigenvector corresponding to the largest eigenvalue
-    v_null = v_nulls[:, 0].reshape(-1, 1)
+    eigen_values, v_nulls = np.linalg.eigh(Q)
+    idx = int(np.argmax(np.real(eigen_values)))
+    max_eigen_value = float(np.real(eigen_values[idx]))
+    v_null = np.asarray(v_nulls[:, idx], dtype=np.complex128).reshape(-1, 1)
     
     return v_null, A, B, max_eigen_value
 

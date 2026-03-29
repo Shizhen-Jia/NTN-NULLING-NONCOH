@@ -122,7 +122,7 @@ class SceneConfigSionna:
         self.tn_height_above_ground = 1.8
         self.ntn_height_above_roof = 1.2  # For base station on building
         self.ntn_height_above_ground = 1.88
-        self.sat_distance = 500e3   # Satellite distance from region (m)
+        self.sat_distance = 550e3   # Satellite distance from region (m)
 
         # Coverage map placeholders
         self.cm = None
@@ -264,7 +264,6 @@ class SceneConfigSionna:
                         azimuth,
                         elevation,
                         centerBS=True,
-                        bs_dist_min=35,
                         bs_dist_max=1000,
                         bs_boundary=0.0,
                         bs_layout="random",
