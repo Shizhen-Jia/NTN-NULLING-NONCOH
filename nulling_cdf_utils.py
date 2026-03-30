@@ -39,6 +39,38 @@ def _interference_power_per_rx(h_ntn_tx: np.ndarray, beam: np.ndarray) -> np.nda
     return np.sum(np.abs(eff) ** 2, axis=1).real.astype(np.float64)
 
 
+def _tn_link_power(
+    h_tn_link: np.ndarray,
+    beam: np.ndarray,
+    rx_combiner: np.ndarray,
+) -> float:
+    """Received TN-link power |v^H H w_r|^2 for one BS-sector beam."""
+    h = np.asarray(h_tn_link, dtype=np.complex128)
+    v = np.asarray(beam, dtype=np.complex128)
+    w_r = np.asarray(rx_combiner, dtype=np.complex128)
+
+    if h.ndim != 2:
+        raise ValueError("h_tn_link must have shape (num_tx_ant, num_tn_rx_ant).")
+    if v.ndim == 1:
+        v = v.reshape(-1, 1)
+    if w_r.ndim == 1:
+        w_r = w_r.reshape(-1, 1)
+    if v.ndim != 2 or v.shape[1] != 1:
+        raise ValueError(f"beam must have shape (num_tx_ant, 1); got {v.shape}.")
+    if w_r.ndim != 2 or w_r.shape[1] != 1:
+        raise ValueError(f"rx_combiner must have shape (num_tn_rx_ant, 1); got {w_r.shape}.")
+    if h.shape[0] != v.shape[0]:
+        raise ValueError(
+            f"Beam dimension mismatch: h_tn_link has {h.shape[0]} TX antennas, beam has {v.shape[0]}."
+        )
+    if h.shape[1] != w_r.shape[0]:
+        raise ValueError(
+            "RX combiner dimension mismatch: "
+            f"h_tn_link has {h.shape[1]} TN RX antennas, rx_combiner has {w_r.shape[0]}."
+        )
+    return float(np.abs((v.conj().T @ h @ w_r).item()) ** 2)
+
+
 def _covariance_from_channel_vectors(
     h_vectors: np.ndarray,
     *,
@@ -652,6 +684,7 @@ def _extract_tx_detected_pairs(
 
 
 def run_small_round(
+    h_tn_all: np.ndarray,
     h_ntn_all: np.ndarray,
     *,
     pairs_by_tx: Dict[int, List[Dict[str, Any]]],
@@ -669,10 +702,14 @@ def run_small_round(
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """Run one small round with three nulling modes on detected NTN pairs."""
+    h_tn_all_arr = np.asarray(h_tn_all, dtype=np.complex128)
     h_ntn = np.asarray(h_ntn_all, dtype=np.complex128)
+    if h_tn_all_arr.ndim != 4:
+        raise ValueError("h_tn_all must have shape (num_tn_rx, num_tn_rx_ant, num_tx, num_tx_ant).")
     if h_ntn.ndim != 4:
         raise ValueError("h_ntn_all must have shape (num_ntn_rx, num_ntn_rx_ant, num_tx, num_tx_ant).")
 
+    num_tn_rx = int(h_tn_all_arr.shape[0])
     num_ntn_rx = int(h_ntn.shape[0])
     num_tx_total = int(h_ntn.shape[2])
     lambda_list = [] if lambda_ranges is None else [float(v) for v in lambda_ranges]
@@ -682,9 +719,13 @@ def run_small_round(
     lambda_list_music_real = [float(v) for v in (lambda_ranges_music_real or [])]
 
     raw_snr_db: List[float] = []
+    raw_sinr_db: List[float] = []
     true_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    true_sinr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
     est_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_est}
+    est_sinr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_est}
     music_real_snr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_real}
+    music_real_sinr_db: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_real}
     raw_inr_power = np.zeros((num_ntn_rx,), dtype=np.float64)
     true_inr_power = {lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list}
     est_inr_power = {lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list_music_est}
@@ -693,6 +734,13 @@ def run_small_round(
     }
     detected_rx_mask = np.zeros((num_ntn_rx,), dtype=bool)
     eval_mask = np.zeros((num_ntn_rx,), dtype=bool)
+    round_pairs: Dict[int, Dict[str, Any]] = {}
+    raw_beams: Dict[int, np.ndarray] = {}
+    true_beams: Dict[float, Dict[int, np.ndarray]] = {lambda_: {} for lambda_ in lambda_list}
+    est_beams: Dict[float, Dict[int, np.ndarray]] = {lambda_: {} for lambda_ in lambda_list_music_est}
+    music_real_beams: Dict[float, Dict[int, np.ndarray]] = {
+        lambda_: {} for lambda_ in lambda_list_music_real
+    }
 
     for tx_idx in range(num_tx_total):
         tx_pairs = pairs_by_tx.get(int(tx_idx), [])
@@ -706,6 +754,15 @@ def run_small_round(
         h_tn = np.asarray(pair["h_tn"], dtype=np.complex128)
         w_t = np.asarray(pair["w_t"], dtype=np.complex128)
         w_r = np.asarray(pair["w_r"], dtype=np.complex128)
+        tn_idx = int(pair["tn_idx"])
+        if tn_idx < 0 or tn_idx >= num_tn_rx:
+            raise ValueError(f"Invalid TN index for round pair: tn_idx={tn_idx}, num_tn_rx={num_tn_rx}.")
+        round_pairs[int(tx_idx)] = {
+            "tn_idx": tn_idx,
+            "h_tn": h_tn,
+            "w_r": w_r,
+        }
+        raw_beams[int(tx_idx)] = w_t
         raw_snr_db.append(float(pair["snr_raw_db"]))
 
         h_ntn_tx = np.asarray(h_ntn[:, :, tx_idx, :], dtype=np.complex128)
@@ -748,6 +805,7 @@ def run_small_round(
 
         for lambda_ in lambda_list:
             v_null_true, _, _, _ = nulling_bf(h_tn, w_r, interference_term_true, lambda_)
+            true_beams[lambda_][int(tx_idx)] = np.asarray(v_null_true, dtype=np.complex128)
 
             true_snr_linear = (
                 np.abs((v_null_true.conj().T @ h_tn @ w_r).item()) ** 2
@@ -760,6 +818,7 @@ def run_small_round(
 
         for lambda_ in lambda_list_music_est:
             v_null_est, _, _, _ = nulling_bf_music_noncoh(h_tn, w_r, u_t, g_t, lambda_, eps=eps)
+            est_beams[lambda_][int(tx_idx)] = np.asarray(v_null_est, dtype=np.complex128)
             est_snr_linear = (
                 np.abs((v_null_est.conj().T @ h_tn @ w_r).item()) ** 2
                 * float(tx_power)
@@ -770,6 +829,7 @@ def run_small_round(
 
         for lambda_ in lambda_list_music_real:
             v_null_music_real, _, _, _ = nulling_bf_music_noncoh(h_tn, w_r, u_true_t, g_true_t,  lambda_, eps=eps)
+            music_real_beams[lambda_][int(tx_idx)] = np.asarray(v_null_music_real, dtype=np.complex128)
             music_real_snr_linear = (
                 np.abs((v_null_music_real.conj().T @ h_tn @ w_r).item()) ** 2
                 * float(tx_power)
@@ -777,6 +837,70 @@ def run_small_round(
             )
             music_real_snr_db[lambda_].append(float(_safe_db(music_real_snr_linear, eps=eps)))
             music_real_inr_power[lambda_] += _interference_power_per_rx(h_ntn_eval_tx, v_null_music_real)
+
+    for tx_idx in range(num_tx_total):
+        pair = round_pairs[int(tx_idx)]
+        tn_idx = int(pair["tn_idx"])
+        h_tn = np.asarray(pair["h_tn"], dtype=np.complex128)
+        w_r = np.asarray(pair["w_r"], dtype=np.complex128)
+
+        desired_raw = _tn_link_power(h_tn, raw_beams[int(tx_idx)], w_r)
+        interf_raw = 0.0
+        for other_tx in range(num_tx_total):
+            if int(other_tx) == int(tx_idx):
+                continue
+            h_interf = np.asarray(h_tn_all_arr[tn_idx, :, other_tx, :], dtype=np.complex128).T
+            interf_raw += _tn_link_power(h_interf, raw_beams[int(other_tx)], w_r)
+        raw_sinr_linear = desired_raw * float(tx_power) / (
+            float(snr_noise_power) + interf_raw * float(tx_power)
+        )
+        raw_sinr_db.append(float(_safe_db(raw_sinr_linear, eps=eps)))
+
+        for lambda_ in lambda_list:
+            beam_true = true_beams[lambda_][int(tx_idx)]
+            desired_true = _tn_link_power(h_tn, beam_true, w_r)
+            interf_true = 0.0
+            for other_tx in range(num_tx_total):
+                if int(other_tx) == int(tx_idx):
+                    continue
+                h_interf = np.asarray(h_tn_all_arr[tn_idx, :, other_tx, :], dtype=np.complex128).T
+                interf_true += _tn_link_power(h_interf, true_beams[lambda_][int(other_tx)], w_r)
+            true_sinr_linear = desired_true * float(tx_power) / (
+                float(snr_noise_power) + interf_true * float(tx_power)
+            )
+            true_sinr_db[lambda_].append(float(_safe_db(true_sinr_linear, eps=eps)))
+
+        for lambda_ in lambda_list_music_est:
+            beam_est = est_beams[lambda_][int(tx_idx)]
+            desired_est = _tn_link_power(h_tn, beam_est, w_r)
+            interf_est = 0.0
+            for other_tx in range(num_tx_total):
+                if int(other_tx) == int(tx_idx):
+                    continue
+                h_interf = np.asarray(h_tn_all_arr[tn_idx, :, other_tx, :], dtype=np.complex128).T
+                interf_est += _tn_link_power(h_interf, est_beams[lambda_][int(other_tx)], w_r)
+            est_sinr_linear = desired_est * float(tx_power) / (
+                float(snr_noise_power) + interf_est * float(tx_power)
+            )
+            est_sinr_db[lambda_].append(float(_safe_db(est_sinr_linear, eps=eps)))
+
+        for lambda_ in lambda_list_music_real:
+            beam_music_real = music_real_beams[lambda_][int(tx_idx)]
+            desired_music_real = _tn_link_power(h_tn, beam_music_real, w_r)
+            interf_music_real = 0.0
+            for other_tx in range(num_tx_total):
+                if int(other_tx) == int(tx_idx):
+                    continue
+                h_interf = np.asarray(h_tn_all_arr[tn_idx, :, other_tx, :], dtype=np.complex128).T
+                interf_music_real += _tn_link_power(
+                    h_interf,
+                    music_real_beams[lambda_][int(other_tx)],
+                    w_r,
+                )
+            music_real_sinr_linear = desired_music_real * float(tx_power) / (
+                float(snr_noise_power) + interf_music_real * float(tx_power)
+            )
+            music_real_sinr_db[lambda_].append(float(_safe_db(music_real_sinr_linear, eps=eps)))
 
     raw_inr_db = (
         _safe_db(raw_inr_power[detected_rx_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
@@ -819,10 +943,20 @@ def run_small_round(
 
     return {
         "raw_snr_db": np.asarray(raw_snr_db, dtype=np.float64),
+        "raw_sinr_db": np.asarray(raw_sinr_db, dtype=np.float64),
         "true_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_snr_db.items()},
+        "true_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_sinr_db.items()
+        },
         "est_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_db.items()},
+        "est_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_sinr_db.items()
+        },
         "music_real_snr_db": {
             lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in music_real_snr_db.items()
+        },
+        "music_real_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in music_real_sinr_db.items()
         },
         "raw_inr_db": np.asarray(raw_inr_db, dtype=np.float64),
         "true_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_inr_db.items()},
@@ -880,10 +1014,16 @@ def run_nulling_cdf_experiment(
     )
     lambda_list_music_real = [float(v) for v in (lambda_ranges_music_real or [])]
     raw_snr_all: List[float] = []
+    raw_sinr_all: List[float] = []
     raw_inr_all: List[float] = []
     true_snr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
+    true_sinr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
     est_snr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_est}
+    est_sinr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list_music_est}
     music_real_snr_all: Dict[float, List[float]] = {
+        lambda_: [] for lambda_ in lambda_list_music_real
+    }
+    music_real_sinr_all: Dict[float, List[float]] = {
         lambda_: [] for lambda_ in lambda_list_music_real
     }
     true_inr_all: Dict[float, List[float]] = {lambda_: [] for lambda_ in lambda_list}
@@ -1031,6 +1171,7 @@ def run_nulling_cdf_experiment(
 
         for round_idx in range(min_count):
             round_out = run_small_round(
+                h_tn_all,
                 h_ntn_all,
                 pairs_by_tx=pairing["pairs_by_tx"],
                 music_lookup=music_lookup,
@@ -1048,10 +1189,14 @@ def run_nulling_cdf_experiment(
             )
 
             raw_snr_all.extend(np.asarray(round_out["raw_snr_db"], dtype=np.float64).tolist())
+            raw_sinr_all.extend(np.asarray(round_out["raw_sinr_db"], dtype=np.float64).tolist())
             raw_inr_all.extend(np.asarray(round_out["raw_inr_db"], dtype=np.float64).tolist())
             for lambda_ in lambda_list:
                 true_snr_all[lambda_].extend(
                     np.asarray(round_out["true_snr_db"][lambda_], dtype=np.float64).tolist()
+                )
+                true_sinr_all[lambda_].extend(
+                    np.asarray(round_out["true_sinr_db"][lambda_], dtype=np.float64).tolist()
                 )
                 true_inr_all[lambda_].extend(
                     np.asarray(round_out["true_inr_db"][lambda_], dtype=np.float64).tolist()
@@ -1060,6 +1205,9 @@ def run_nulling_cdf_experiment(
                 est_snr_all[lambda_].extend(
                     np.asarray(round_out["est_snr_db"][lambda_], dtype=np.float64).tolist()
                 )
+                est_sinr_all[lambda_].extend(
+                    np.asarray(round_out["est_sinr_db"][lambda_], dtype=np.float64).tolist()
+                )
                 est_inr_all[lambda_].extend(
                     np.asarray(round_out["est_inr_db"][lambda_], dtype=np.float64).tolist()
                 )
@@ -1067,17 +1215,30 @@ def run_nulling_cdf_experiment(
                 music_real_snr_all[lambda_].extend(
                     np.asarray(round_out["music_real_snr_db"][lambda_], dtype=np.float64).tolist()
                 )
+                music_real_sinr_all[lambda_].extend(
+                    np.asarray(round_out["music_real_sinr_db"][lambda_], dtype=np.float64).tolist()
+                )
                 music_real_inr_all[lambda_].extend(
                     np.asarray(round_out["music_real_inr_db"][lambda_], dtype=np.float64).tolist()
                 )
 
     return {
         "raw_snr_db": np.asarray(raw_snr_all, dtype=np.float64),
+        "raw_sinr_db": np.asarray(raw_sinr_all, dtype=np.float64),
         "raw_inr_db": np.asarray(raw_inr_all, dtype=np.float64),
         "true_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_snr_all.items()},
+        "true_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_sinr_all.items()
+        },
         "est_snr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_snr_all.items()},
+        "est_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_sinr_all.items()
+        },
         "music_real_snr_db": {
             lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in music_real_snr_all.items()
+        },
+        "music_real_sinr_db": {
+            lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in music_real_sinr_all.items()
         },
         "true_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in true_inr_all.items()},
         "est_inr_db": {lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in est_inr_all.items()},
@@ -1106,6 +1267,7 @@ def save_experiment_metrics(
 
     save_dict: Dict[str, Any] = {
         "raw_snr_db": np.asarray(experiment_out["raw_snr_db"], dtype=np.float64),
+        "raw_sinr_db": np.asarray(experiment_out.get("raw_sinr_db", np.empty((0,), dtype=np.float64)), dtype=np.float64),
         "raw_inr_db": np.asarray(experiment_out["raw_inr_db"], dtype=np.float64),
         "lambda_ranges": np.asarray(experiment_out["lambda_ranges"], dtype=np.float64),
         "lambda_ranges_music_est": np.asarray(
@@ -1122,14 +1284,20 @@ def save_experiment_metrics(
         save_dict["bs_pos_ref"] = np.asarray(experiment_out["bs_pos_ref"], dtype=np.float64)
     for lambda_, vals in experiment_out["true_snr_db"].items():
         save_dict[f"true_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out.get("true_sinr_db", {}).items():
+        save_dict[f"true_sinr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out["est_snr_db"].items():
         save_dict[f"est_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out.get("est_sinr_db", {}).items():
+        save_dict[f"est_sinr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out["true_inr_db"].items():
         save_dict[f"true_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out["est_inr_db"].items():
         save_dict[f"est_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out.get("music_real_snr_db", {}).items():
         save_dict[f"music_real_snr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
+    for lambda_, vals in experiment_out.get("music_real_sinr_db", {}).items():
+        save_dict[f"music_real_sinr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
     for lambda_, vals in experiment_out.get("music_real_inr_db", {}).items():
         save_dict[f"music_real_inr_db_{lambda_:.0e}"] = np.asarray(vals, dtype=np.float64)
 
