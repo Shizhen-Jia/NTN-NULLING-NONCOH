@@ -435,6 +435,60 @@ def pair_tn_to_strongest_tx(
     }
 
 
+def build_precoding_matrix_from_tx_beams(
+    tx_name_list: Iterable[str],
+    tx_beams: Dict[int, np.ndarray],
+    *,
+    nsect: int,
+    num_tx_ant: int | None = None,
+    dtype: np.dtype = np.complex64,
+    apply_conjugate: bool = True,
+) -> np.ndarray:
+    """Map per-TX beam vectors into scene-transmitter order.
+
+    By default, this applies complex conjugation before exporting the beam.
+    This matches the legacy notebook/Sionna convention where the optimization
+    uses vectors in expressions like ``v^H H w_r`` while Sionna's precoder
+    expects the actual TX weight vector ``conj(v)``.
+    """
+    tx_names = [str(name) for name in tx_name_list]
+    if num_tx_ant is None:
+        if len(tx_beams) == 0:
+            raise ValueError("num_tx_ant is required when tx_beams is empty.")
+        num_tx_ant = int(
+            np.asarray(next(iter(tx_beams.values())), dtype=np.complex128).reshape(-1).shape[0]
+        )
+    else:
+        num_tx_ant = int(num_tx_ant)
+
+    precoding = np.zeros((len(tx_names), num_tx_ant), dtype=dtype)
+    for row_idx, name in enumerate(tx_names):
+        if not name.startswith("tx-"):
+            continue
+        parts = name.split("-")
+        if len(parts) != 3:
+            continue
+        try:
+            bs_idx = int(parts[1])
+            sec_idx = int(parts[2])
+        except ValueError:
+            continue
+        tx_idx = int(bs_idx) * int(nsect) + int(sec_idx)
+        beam = tx_beams.get(int(tx_idx))
+        if beam is None:
+            continue
+        beam_vec = np.asarray(beam, dtype=np.complex128).reshape(-1)
+        if beam_vec.shape[0] != num_tx_ant:
+            raise ValueError(
+                f"Beam dimension mismatch for tx_idx={tx_idx}: "
+                f"expected {num_tx_ant}, got {beam_vec.shape[0]}."
+            )
+        if bool(apply_conjugate):
+            beam_vec = np.conjugate(beam_vec)
+        precoding[row_idx, :] = beam_vec.astype(dtype, copy=False)
+    return precoding
+
+
 def build_music_tx_lookup(
     ntn_music_out: Dict[str, Any],
     *,
@@ -964,7 +1018,41 @@ def run_small_round(
         "music_real_inr_db": {
             lambda_: np.asarray(vals, dtype=np.float64) for lambda_, vals in music_real_inr_db.items()
         },
+        "round_pairs": {
+            int(tx_idx): {
+                "tn_idx": int(pair["tn_idx"]),
+                "h_tn": np.asarray(pair["h_tn"], dtype=np.complex128),
+                "w_r": np.asarray(pair["w_r"], dtype=np.complex128),
+            }
+            for tx_idx, pair in round_pairs.items()
+        },
+        "raw_beams": {
+            int(tx_idx): np.asarray(beam, dtype=np.complex128)
+            for tx_idx, beam in raw_beams.items()
+        },
+        "true_beams": {
+            float(lambda_): {
+                int(tx_idx): np.asarray(beam, dtype=np.complex128)
+                for tx_idx, beam in beam_dict.items()
+            }
+            for lambda_, beam_dict in true_beams.items()
+        },
+        "est_beams": {
+            float(lambda_): {
+                int(tx_idx): np.asarray(beam, dtype=np.complex128)
+                for tx_idx, beam in beam_dict.items()
+            }
+            for lambda_, beam_dict in est_beams.items()
+        },
+        "music_real_beams": {
+            float(lambda_): {
+                int(tx_idx): np.asarray(beam, dtype=np.complex128)
+                for tx_idx, beam in beam_dict.items()
+            }
+            for lambda_, beam_dict in music_real_beams.items()
+        },
         "detected_mask": detected_rx_mask,
+        "eval_mask": eval_mask,
         "detected_count": int(np.count_nonzero(detected_rx_mask)),
     }
 
