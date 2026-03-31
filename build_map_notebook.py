@@ -80,6 +80,7 @@ def main() -> None:
                 import mitsuba as mi
                 import numpy as np
                 from matplotlib.colors import ListedColormap
+                from matplotlib.lines import Line2D
                 from sionna.rt import Camera, RadioMapSolver, Receiver, load_scene
 
                 try:
@@ -593,6 +594,7 @@ def main() -> None:
                     paired_idx,
                     paired_tx,
                     paired_bs,
+                    figure_width_in=3.45,
                 ):
                     image_path = Path(image_path)
                     if not image_path.exists():
@@ -601,18 +603,39 @@ def main() -> None:
                     bg_img = plt.imread(str(image_path))
                     bs_colors = _bs_color_map(scene_config)
 
-                    fig, ax = plt.subplots(figsize=(8.2, 6.5))
+                    fig, ax = plt.subplots(figsize=(figure_width_in, figure_width_in))
                     ax.imshow(bg_img, extent=scene_config.extent, aspect="auto")
+                    try:
+                        ax.set_box_aspect(1)
+                    except Exception:
+                        ax.set_aspect("equal", adjustable="box")
+
+                    x_span = float(scene_config.extent[1] - scene_config.extent[0])
+                    y_span = float(scene_config.extent[3] - scene_config.extent[2])
+                    bs_label_dx = 0.012 * x_span
+                    bs_label_dy = 0.012 * y_span
 
                     for bs_idx in range(int(scene_config.tx_pos.shape[0])):
+                        x_bs = scene_config.tx_pos[bs_idx, 0]
+                        y_bs = scene_config.tx_pos[bs_idx, 1]
                         ax.scatter(
-                            [scene_config.tx_pos[bs_idx, 0]],
-                            [scene_config.tx_pos[bs_idx, 1]],
+                            [x_bs],
+                            [y_bs],
                             c=[bs_colors[int(bs_idx)]],
                             marker=(3, 0, -30),
-                            s=180,
-                            linewidths=1.2,
-                            label=f"BS {int(bs_idx)}",
+                            s=250,
+                            linewidths=1.3,
+                        )
+                        ax.text(
+                            x_bs + bs_label_dx,
+                            y_bs + bs_label_dy,
+                            f"{int(bs_idx)}",
+                            color=bs_colors[int(bs_idx)],
+                            fontsize=8.6,
+                            weight="bold",
+                            ha="left",
+                            va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.85),
                         )
 
                     if detected_idx.size > 0:
@@ -621,9 +644,8 @@ def main() -> None:
                             scene_config.rx_ntn_pos[detected_idx, 1],
                             c="#0057b8",
                             marker="x",
-                            s=34,
-                            linewidths=1.5,
-                            label="Detected NTN",
+                            s=58,
+                            linewidths=1.8,
                         )
 
                     if paired_idx.size > 0:
@@ -632,9 +654,8 @@ def main() -> None:
                             scene_config.tn_pos[paired_idx, 1],
                             c="#2ca02c",
                             marker="x",
-                            s=28,
-                            linewidths=1.2,
-                            label="Paired TN",
+                            s=46,
+                            linewidths=1.5,
                         )
 
                     for tn_idx, tx_idx, bs_idx in zip(
@@ -650,26 +671,79 @@ def main() -> None:
                             facecolors="none",
                             edgecolors=[color],
                             marker="o",
-                            s=165,
-                            linewidths=2.0,
+                            s=225,
+                            linewidths=2.2,
                         )
                         ax.text(
                             x + 18.0,
                             y + 18.0,
                             f"b{int(bs_idx)}s{int(tx_idx) % int(nsect)}",
                             color=color,
-                            fontsize=8,
+                            fontsize=8.2,
                             weight="bold",
                         )
 
-                    ax.set_title("Detected NTN And Round-0 Paired TN On layout1.png")
-                    ax.set_xlabel("x (m)")
-                    ax.set_ylabel("y (m)")
-                    ax.legend(loc="upper right", frameon=True)
-                    fig.tight_layout()
+                    ax.set_xlabel("x (m)", fontsize=9.2)
+                    ax.set_ylabel("y (m)", fontsize=9.2)
+                    ax.tick_params(axis="both", which="major", labelsize=8.2)
+                    ax.legend(
+                        handles=[
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="^",
+                                linestyle="None",
+                                color="0.25",
+                                markerfacecolor="0.25",
+                                markersize=7.2,
+                                label="BS site (ID)",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="x",
+                                linestyle="None",
+                                color="#0057b8",
+                                markersize=7.4,
+                                markeredgewidth=1.6,
+                                label="Detected NTN",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="x",
+                                linestyle="None",
+                                color="#2ca02c",
+                                markersize=7.0,
+                                markeredgewidth=1.4,
+                                label="Paired TN",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                linestyle="None",
+                                color="black",
+                                markerfacecolor="none",
+                                markersize=8.1,
+                                markeredgewidth=1.7,
+                                label="Serving BS ring",
+                            ),
+                        ],
+                        loc="upper center",
+                        ncol=2,
+                        fontsize=7.8,
+                        frameon=True,
+                        framealpha=0.92,
+                        borderpad=0.3,
+                        handletextpad=0.4,
+                        columnspacing=0.8,
+                        labelspacing=0.35,
+                    )
+                    fig.tight_layout(pad=0.3)
                     fig.savefig(
                         result_dir / "layout_detected_and_paired_layout1.png",
-                        dpi=220,
+                        dpi=300,
                         bbox_inches="tight",
                     )
                     plt.show()
