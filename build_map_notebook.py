@@ -434,7 +434,7 @@ def main() -> None:
             dedent(
                 """
                 def _bs_color_map(scene_config):
-                    palette = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#8c564b", "#9467bd"]
+                    palette = ["#d62728", "#ff7f0e", "#8c564b", "#9467bd", "#7f7f7f", "#bcbd22"]
                     return {
                         int(bs_idx): palette[int(bs_idx) % len(palette)]
                         for bs_idx in range(int(scene_config.tx_pos.shape[0]))
@@ -595,6 +595,7 @@ def main() -> None:
                     paired_tx,
                     paired_bs,
                     figure_width_in=3.45,
+                    show_bs_labels=False,
                 ):
                     image_path = Path(image_path)
                     if not image_path.exists():
@@ -610,11 +611,6 @@ def main() -> None:
                     except Exception:
                         ax.set_aspect("equal", adjustable="box")
 
-                    x_span = float(scene_config.extent[1] - scene_config.extent[0])
-                    y_span = float(scene_config.extent[3] - scene_config.extent[2])
-                    bs_label_dx = 0.012 * x_span
-                    bs_label_dy = 0.012 * y_span
-
                     for bs_idx in range(int(scene_config.tx_pos.shape[0])):
                         x_bs = scene_config.tx_pos[bs_idx, 0]
                         y_bs = scene_config.tx_pos[bs_idx, 1]
@@ -623,20 +619,23 @@ def main() -> None:
                             [y_bs],
                             c=[bs_colors[int(bs_idx)]],
                             marker=(3, 0, -30),
-                            s=250,
-                            linewidths=1.3,
+                            s=135,
+                            linewidths=1.0,
                         )
-                        ax.text(
-                            x_bs + bs_label_dx,
-                            y_bs + bs_label_dy,
-                            f"{int(bs_idx)}",
-                            color=bs_colors[int(bs_idx)],
-                            fontsize=8.6,
-                            weight="bold",
-                            ha="left",
-                            va="bottom",
-                            bbox=dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.85),
-                        )
+                        if show_bs_labels:
+                            label_dx = 0.006 * (scene_config.extent[1] - scene_config.extent[0])
+                            label_dy = 0.006 * (scene_config.extent[3] - scene_config.extent[2])
+                            ax.text(
+                                x_bs + label_dx,
+                                y_bs + label_dy,
+                                f"{int(bs_idx)}",
+                                color=bs_colors[int(bs_idx)],
+                                fontsize=7.2,
+                                weight="bold",
+                                ha="left",
+                                va="bottom",
+                                bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.8),
+                            )
 
                     if detected_idx.size > 0:
                         ax.scatter(
@@ -644,8 +643,8 @@ def main() -> None:
                             scene_config.rx_ntn_pos[detected_idx, 1],
                             c="#0057b8",
                             marker="x",
-                            s=58,
-                            linewidths=1.8,
+                            s=24,
+                            linewidths=1.2,
                         )
 
                     if paired_idx.size > 0:
@@ -654,11 +653,11 @@ def main() -> None:
                             scene_config.tn_pos[paired_idx, 1],
                             c="#2ca02c",
                             marker="x",
-                            s=46,
-                            linewidths=1.5,
+                            s=20,
+                            linewidths=1.1,
                         )
 
-                    for tn_idx, tx_idx, bs_idx in zip(
+                    for tn_idx, _tx_idx, bs_idx in zip(
                         paired_idx.tolist(),
                         paired_tx.tolist(),
                         paired_bs.tolist(),
@@ -671,16 +670,8 @@ def main() -> None:
                             facecolors="none",
                             edgecolors=[color],
                             marker="o",
-                            s=225,
-                            linewidths=2.2,
-                        )
-                        ax.text(
-                            x + 18.0,
-                            y + 18.0,
-                            f"b{int(bs_idx)}s{int(tx_idx) % int(nsect)}",
-                            color=color,
-                            fontsize=8.2,
-                            weight="bold",
+                            s=92,
+                            linewidths=1.5,
                         )
 
                     ax.set_xlabel("x (m)", fontsize=9.2)
@@ -695,8 +686,8 @@ def main() -> None:
                                 linestyle="None",
                                 color="0.25",
                                 markerfacecolor="0.25",
-                                markersize=7.2,
-                                label="BS site (ID)",
+                                markersize=5.8,
+                                label="BS site",
                             ),
                             Line2D(
                                 [0],
@@ -704,8 +695,8 @@ def main() -> None:
                                 marker="x",
                                 linestyle="None",
                                 color="#0057b8",
-                                markersize=7.4,
-                                markeredgewidth=1.6,
+                                markersize=5.8,
+                                markeredgewidth=1.2,
                                 label="Detected NTN",
                             ),
                             Line2D(
@@ -714,8 +705,8 @@ def main() -> None:
                                 marker="x",
                                 linestyle="None",
                                 color="#2ca02c",
-                                markersize=7.0,
-                                markeredgewidth=1.4,
+                                markersize=5.4,
+                                markeredgewidth=1.1,
                                 label="Paired TN",
                             ),
                             Line2D(
@@ -725,16 +716,18 @@ def main() -> None:
                                 linestyle="None",
                                 color="black",
                                 markerfacecolor="none",
-                                markersize=8.1,
-                                markeredgewidth=1.7,
+                                markersize=6.2,
+                                markeredgewidth=1.3,
                                 label="Serving BS ring",
                             ),
                         ],
                         loc="upper center",
                         ncol=2,
-                        fontsize=7.8,
+                        fontsize=7.2,
                         frameon=True,
-                        framealpha=0.92,
+                        framealpha=0.62,
+                        facecolor="white",
+                        edgecolor="0.75",
                         borderpad=0.3,
                         handletextpad=0.4,
                         columnspacing=0.8,
