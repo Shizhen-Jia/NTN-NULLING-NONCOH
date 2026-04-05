@@ -8,6 +8,7 @@ import numpy as np
 from BeamformingCalc import nulling_bf, nulling_bf_music_noncoh, svd_bf
 from ntn_music_detection import (
     build_ntn_truth_from_paths,
+    blind_music_detection_name,
     collapse_cir_to_narrowband,
     run_music_standard_pipeline,
     summarize_ntn_music_quality,
@@ -173,7 +174,7 @@ def summarize_music_noncoh_quality(
     max_detected_b_terms: str | int | None = "all",
     eps: float = 1e-12,
 ) -> Dict[str, float | int]:
-    """Summarize per-simulation MUSIC noncoherent `(u, g)` quality."""
+    """Summarize per-simulation Blind MDL-MUSIC noncoherent `(u, g)` quality."""
     h_ntn = np.asarray(h_ntn_all, dtype=np.complex128)
     if h_ntn.ndim != 4:
         raise ValueError("h_ntn_all must have shape (num_ntn_rx, num_ntn_rx_ant, num_tx, num_tx_ant).")
@@ -186,6 +187,71 @@ def summarize_music_noncoh_quality(
 
     for tx_idx in range(num_tx_total):
         lookup = music_lookup.get(int(tx_idx), {})
+        pair_rx_lookup = np.asarray(lookup.get("pair_rx", np.empty((0,), dtype=int)), dtype=int)
+        pair_rx_ant_lookup = np.asarray(lookup.get("pair_rx_ant", np.empty((0,), dtype=int)), dtype=int)
+        u_lookup = np.asarray(
+            lookup.get("u", np.empty((0, num_tx_ant), dtype=np.complex128)),
+            dtype=np.complex128,
+        )
+        g_lookup = np.asarray(lookup.get("g", np.empty((0,), dtype=np.float64)), dtype=np.float64).reshape(-1)
+
+        anonymous_mode = (
+            pair_rx_lookup.size == 0
+            and pair_rx_ant_lookup.size == 0
+            and u_lookup.ndim == 2
+            and u_lookup.shape[0] == g_lookup.size
+            and g_lookup.size > 0
+        )
+
+        if anonymous_mode:
+            h_true_all = np.asarray(h_ntn[:, :, tx_idx, :], dtype=np.complex128).reshape(-1, num_tx_ant)
+            u_true_all, g_true_all = _channel_vectors_to_noncoh_terms(
+                h_true_all,
+                num_tx_ant=num_tx_ant,
+                eps=eps,
+            )
+            if u_true_all.shape[0] == 0:
+                continue
+
+            u_est_t = np.asarray(u_lookup, dtype=np.complex128)
+            g_est_t = np.asarray(g_lookup, dtype=np.float64)
+            est_norm = np.linalg.norm(u_est_t, axis=1, keepdims=True)
+            true_norm = np.linalg.norm(u_true_all, axis=1, keepdims=True)
+            u_est_n = u_est_t / np.maximum(est_norm, float(eps))
+            u_true_n = u_true_all / np.maximum(true_norm, float(eps))
+            corr = np.abs(u_est_n @ np.conjugate(u_true_n).T)
+
+            matched_true: set[int] = set()
+            u_rho_t: List[float] = []
+            g_rel_err_t: List[float] = []
+            est_order = np.argsort(-np.nan_to_num(g_est_t, nan=0.0))
+            for est_idx in est_order.tolist():
+                if corr.shape[1] == 0:
+                    break
+                cand_order = np.argsort(-corr[est_idx])
+                match_idx = None
+                for cand_idx in cand_order.tolist():
+                    if cand_idx not in matched_true:
+                        match_idx = int(cand_idx)
+                        matched_true.add(match_idx)
+                        break
+                if match_idx is None:
+                    match_idx = int(cand_order[0])
+                u_rho_t.append(float(corr[est_idx, match_idx]))
+                g_rel_err_t.append(
+                    float(
+                        np.abs(g_est_t[est_idx] - g_true_all[match_idx])
+                        / np.maximum(np.abs(g_true_all[match_idx]), float(eps))
+                    )
+                )
+
+            if len(u_rho_t) == 0:
+                continue
+            tx_with_pairs += 1
+            u_rho_all.append(np.asarray(u_rho_t, dtype=np.float64))
+            g_rel_err_all.append(np.asarray(g_rel_err_t, dtype=np.float64))
+            continue
+
         tx_inputs = _extract_tx_detected_pairs(
             h_ntn[:, :, tx_idx, :],
             lookup,
@@ -496,7 +562,57 @@ def build_music_tx_lookup(
     num_tx_total: int,
     num_tx_ant: int,
 ) -> Dict[int, Dict[str, np.ndarray]]:
-    """Collect detected NTN pair data per TX for MUSIC-guided nulling."""
+    """Collect per-TX Blind MDL-MUSIC terms for downstream nulling.
+
+    In blind mode the primary detector outputs are anonymous `peak_*` terms.
+    The paired-link fields are only a fallback for legacy evaluation paths.
+    """
+    peak_t = np.asarray(ntn_music_out.get("peak_t_idx", []), dtype=int)
+    peak_u = np.asarray(ntn_music_out.get("peak_u_hat_raw", []), dtype=np.complex128)
+    peak_g = np.asarray(ntn_music_out.get("peak_g_hat", []), dtype=np.float64)
+    peak_selection_score = np.asarray(ntn_music_out.get("peak_selection_score", []), dtype=float)
+    detected_rx_by_tx_raw = ntn_music_out.get("detected_rx_indices_by_tx", {})
+
+    if peak_t.size > 0:
+        if peak_u.ndim == 1:
+            if peak_u.size == num_tx_ant:
+                peak_u = peak_u.reshape(1, -1)
+            else:
+                raise ValueError(f"Unexpected peak_u shape: {peak_u.shape}")
+        if peak_u.ndim != 2:
+            raise ValueError(f"peak_u_hat must be 2D after reshape, got {peak_u.shape}")
+        if peak_u.shape[1] != num_tx_ant:
+            raise ValueError(
+                f"peak_u_hat antenna dimension mismatch: expected {num_tx_ant}, got {peak_u.shape[1]}."
+            )
+        if not (peak_t.size == peak_u.shape[0] == peak_g.size):
+            raise ValueError("Inconsistent blind detector peak lengths in ntn_music_out.")
+        if peak_selection_score.size not in (0, peak_t.size):
+            raise ValueError("peak_selection_score length does not match blind peak count.")
+
+        lookup: Dict[int, Dict[str, np.ndarray]] = {}
+        for tx_idx in range(num_tx_total):
+            tx_mask = peak_t == int(tx_idx)
+            if peak_selection_score.size > 0:
+                selection_score_t = np.asarray(peak_selection_score[tx_mask], dtype=float)
+            else:
+                selection_score_t = np.full((int(np.count_nonzero(tx_mask)),), np.nan, dtype=float)
+
+            detected_rx_t = np.asarray(
+                detected_rx_by_tx_raw.get(int(tx_idx), np.empty((0,), dtype=int)),
+                dtype=int,
+            )
+            detected_rx_t = detected_rx_t[(detected_rx_t >= 0) & (detected_rx_t < num_ntn_rx)]
+            lookup[int(tx_idx)] = {
+                "rx_detected": np.unique(detected_rx_t).astype(int),
+                "pair_rx": np.empty((0,), dtype=int),
+                "pair_rx_ant": np.empty((0,), dtype=int),
+                "selection_score": selection_score_t,
+                "u": np.asarray(peak_u[tx_mask], dtype=np.complex128),
+                "g": np.asarray(peak_g[tx_mask], dtype=np.float64),
+            }
+        return lookup
+
     pair_rx = np.asarray(ntn_music_out.get("pair_rx_idx", []), dtype=int)
     pair_t = np.asarray(ntn_music_out.get("pair_t_idx", []), dtype=int)
     # pair_u = np.asarray(ntn_music_out.get("pair_u_hat", []), dtype=np.complex128)
@@ -630,11 +746,14 @@ def _extract_tx_music_terms(
             raise ValueError(f"Unexpected u shape for one TX: {u_t.shape}")
     if u_t.ndim != 2 or u_t.shape[1] != num_tx_ant:
         raise ValueError(f"u must have shape (K, {num_tx_ant}) for one TX; got {u_t.shape}.")
-    if not (pair_rx_t.size == pair_rx_ant_t.size == u_t.shape[0] == g_t.size):
-        raise ValueError(
-            "Inconsistent per-TX MUSIC lookup lengths: "
-            f"pair_rx={pair_rx_t.size}, pair_rx_ant={pair_rx_ant_t.size}, u={u_t.shape[0]}, g={g_t.size}."
-        )
+
+    anonymous_mode = pair_rx_t.size == 0 and pair_rx_ant_t.size == 0 and u_t.shape[0] == g_t.size
+    if not anonymous_mode:
+        if not (pair_rx_t.size == pair_rx_ant_t.size == u_t.shape[0] == g_t.size):
+            raise ValueError(
+                "Inconsistent per-TX MUSIC lookup lengths: "
+                f"pair_rx={pair_rx_t.size}, pair_rx_ant={pair_rx_ant_t.size}, u={u_t.shape[0]}, g={g_t.size}."
+            )
     if selection_score_t.size not in (0, g_t.size):
         raise ValueError(
             "Inconsistent per-TX selection score length: "
@@ -643,13 +762,14 @@ def _extract_tx_music_terms(
     if selection_score_t.size == 0 and g_t.size > 0:
         selection_score_t = np.full((g_t.size,), np.nan, dtype=float)
 
-    pair_rx_t, pair_rx_ant_t, selection_score_t, u_t, g_t = _dedupe_tx_pair_candidates(
-        pair_rx_t,
-        pair_rx_ant_t,
-        selection_score_t,
-        u_t,
-        g_t,
-    )
+    if not anonymous_mode:
+        pair_rx_t, pair_rx_ant_t, selection_score_t, u_t, g_t = _dedupe_tx_pair_candidates(
+            pair_rx_t,
+            pair_rx_ant_t,
+            selection_score_t,
+            u_t,
+            g_t,
+        )
 
     max_terms = _resolve_b_term_limit(max_detected_b_terms)
     if max_terms is not None and g_t.size > max_terms:
@@ -786,8 +906,9 @@ def run_small_round(
     music_real_inr_power = {
         lambda_: np.zeros((num_ntn_rx,), dtype=np.float64) for lambda_ in lambda_list_music_real
     }
+    interfered_rx_mask = np.any(np.abs(h_ntn) > eps, axis=(1, 2, 3))
     detected_rx_mask = np.zeros((num_ntn_rx,), dtype=bool)
-    eval_mask = np.zeros((num_ntn_rx,), dtype=bool)
+    eval_mask = np.asarray(interfered_rx_mask, dtype=bool).copy()
     round_pairs: Dict[int, Dict[str, Any]] = {}
     raw_beams: Dict[int, np.ndarray] = {}
     true_beams: Dict[float, Dict[int, np.ndarray]] = {lambda_: {} for lambda_ in lambda_list}
@@ -832,19 +953,11 @@ def run_small_round(
         )
         u_t = np.asarray(est_inputs["u"], dtype=np.complex128)
         g_t = np.asarray(est_inputs["g"], dtype=np.float64)
-
-        tx_inputs = _extract_tx_detected_pairs(
-            h_ntn_tx,
-            lookup,
-            num_tx_ant=h_tn.shape[0],
-            max_detected_b_terms=max_detected_b_terms,
-        )
-        selected_rx_t = np.asarray(tx_inputs["selected_rx"], dtype=int)
-        if selected_rx_t.size > 0:
-            eval_mask[selected_rx_t] = True
-
-        h_ntn_eval_tx = np.asarray(tx_inputs["h_eval"], dtype=np.complex128)
-        h_true_t = np.asarray(tx_inputs["h_true"], dtype=np.complex128)
+        h_ntn_eval_tx = np.asarray(h_ntn_tx, dtype=np.complex128)
+        h_true_flat = np.asarray(h_ntn_tx, dtype=np.complex128).reshape(-1, h_tn.shape[0])
+        finite_rows = np.all(np.isfinite(np.real(h_true_flat)) & np.isfinite(np.imag(h_true_flat)), axis=1)
+        nonzero_rows = np.linalg.norm(h_true_flat, axis=1) > float(eps)
+        h_true_t = np.asarray(h_true_flat[finite_rows & nonzero_rows], dtype=np.complex128)
 
         interference_term_true = _covariance_from_channel_vectors(
             h_true_t,
@@ -956,18 +1069,19 @@ def run_small_round(
             )
             music_real_sinr_db[lambda_].append(float(_safe_db(music_real_sinr_linear, eps=eps)))
 
+    inr_eval_mask = np.asarray(interfered_rx_mask, dtype=bool)
     raw_inr_db = (
-        _safe_db(raw_inr_power[detected_rx_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
-        if np.any(detected_rx_mask)
+        _safe_db(raw_inr_power[inr_eval_mask] * float(tx_power) / float(inr_noise_power), eps=eps)
+        if np.any(inr_eval_mask)
         else np.empty((0,), dtype=np.float64)
     )
     true_inr_db = {
         lambda_: (
             _safe_db(
-                true_inr_power[lambda_][eval_mask] * float(tx_power) / float(inr_noise_power),
+                true_inr_power[lambda_][inr_eval_mask] * float(tx_power) / float(inr_noise_power),
                 eps=eps,
             )
-            if np.any(eval_mask)
+            if np.any(inr_eval_mask)
             else np.empty((0,), dtype=np.float64)
         )
         for lambda_ in lambda_list
@@ -975,10 +1089,10 @@ def run_small_round(
     est_inr_db = {
         lambda_: (
             _safe_db(
-                est_inr_power[lambda_][detected_rx_mask] * float(tx_power) / float(inr_noise_power),
+                est_inr_power[lambda_][inr_eval_mask] * float(tx_power) / float(inr_noise_power),
                 eps=eps,
             )
-            if np.any(detected_rx_mask)
+            if np.any(inr_eval_mask)
             else np.empty((0,), dtype=np.float64)
         )
         for lambda_ in lambda_list_music_est
@@ -986,10 +1100,10 @@ def run_small_round(
     music_real_inr_db = {
         lambda_: (
             _safe_db(
-                music_real_inr_power[lambda_][eval_mask] * float(tx_power) / float(inr_noise_power),
+                music_real_inr_power[lambda_][inr_eval_mask] * float(tx_power) / float(inr_noise_power),
                 eps=eps,
             )
-            if np.any(eval_mask)
+            if np.any(inr_eval_mask)
             else np.empty((0,), dtype=np.float64)
         )
         for lambda_ in lambda_list_music_real
@@ -1191,6 +1305,14 @@ def run_nulling_cdf_experiment(
             h_ntn_all,
             **music_kwargs,
         )
+        detection_name = str(
+            ntn_music_out.get(
+                "detection_name",
+                blind_music_detection_name(
+                    str(music_kwargs.get("detect_source_estimation", "mdl"))
+                ),
+            )
+        )
         ntn_truth = build_ntn_truth_from_paths(
             scene_config.paths_ntn,
             scene_config.a_ntn,
@@ -1224,7 +1346,7 @@ def run_nulling_cdf_experiment(
         angle_metrics = music_quality["angle_metrics"]
         if print_music_u_corr:
             print(
-                "[MUSIC sim] "
+                f"[{detection_name} sim] "
                 f"sim={int(sim_idx)} "
                 f"sat_az_deg={float(sat_azimuth_deg):.2f} sat_el_deg={float(sat_elevation_deg):.2f} "
                 f"det_ntn={int(detected_rx_union.size)} interf_ntn={int(interfered_ntn_count)} "
